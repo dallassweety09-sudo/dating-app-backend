@@ -8,8 +8,12 @@ const Database = require("better-sqlite3");
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+// DB_PATH : en local, un simple fichier suffit. En production sur Railway, cette variable
+// doit pointer vers un dossier monté sur un Volume permanent (ex: /data/dating_app.db),
+// sinon la base repart de zéro à chaque nouveau déploiement.
+const DB_PATH = process.env.DB_PATH || "dating_app.db";
 
-const db = new Database("dating_app.db");
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 // ---------- Schéma ----------
