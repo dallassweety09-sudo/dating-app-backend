@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS users (
   city TEXT DEFAULT '',
   bio TEXT DEFAULT '',
   img TEXT DEFAULT '',
+  intention TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -51,6 +52,14 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 `);
+
+// Migration douce : si la base existait déjà avant l'ajout de la colonne "intention",
+// on l'ajoute maintenant sans effacer aucune donnée existante.
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN intention TEXT DEFAULT ''`);
+} catch (e) {
+  // La colonne existe déjà : rien à faire, c'est normal après le premier déploiement.
+}
 
 const app = express();
 app.use(cors());
@@ -82,7 +91,7 @@ function publicUser(u) {
 
 // ---------- Auth routes ----------
 app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password } = req.body || {};
+  const { name, email, password, intention } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: "Nom, email et mot de passe sont requis." });
   }
@@ -91,8 +100,8 @@ app.post("/api/auth/register", async (req, res) => {
 
   const hash = await bcrypt.hash(password, 10);
   const info = db
-    .prepare("INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)")
-    .run(name, email, hash);
+    .prepare("INSERT INTO users (name, email, password_hash, intention) VALUES (?, ?, ?, ?)")
+    .run(name, email, hash, intention || "");
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   res.json({ token: signToken(user), user: publicUser(user) });
 });
@@ -113,18 +122,19 @@ app.get("/api/me", authMiddleware, (req, res) => {
 });
 
 app.put("/api/me", authMiddleware, (req, res) => {
-  const { name, age, genre, city, bio, img } = req.body || {};
+  const { name, age, genre, city, bio, img, intention } = req.body || {};
   db.prepare(
     `UPDATE users SET name = COALESCE(?, name), age = COALESCE(?, age), genre = COALESCE(?, genre),
-     city = COALESCE(?, city), bio = COALESCE(?, bio), img = COALESCE(?, img) WHERE id = ?`
-  ).run(name, age, genre, city, bio, img, req.userId);
+     city = COALESCE(?, city), bio = COALESCE(?, bio), img = COALESCE(?, img),
+     intention = COALESCE(?, intention) WHERE id = ?`
+  ).run(name, age, genre, city, bio, img, intention, req.userId);
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
   res.json({ user: publicUser(user) });
 });
 
 // ---------- Discover (avec filtres) ----------
 app.get("/api/discover", authMiddleware, (req, res) => {
-  const { genre = "Tous", ageMin = 18, ageMax = 99 } = req.query;
+  const { genre = "Tous", ageMin = 18, ageMax = 99, intention = "" } = req.query;
 
   const alreadySwiped = db
     .prepare("SELECT to_user_id FROM swipes WHERE from_user_id = ?")
@@ -134,13 +144,17 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const exclude = [req.userId, ...alreadySwiped];
   const placeholders = exclude.map(() => "?").join(",");
 
-  let query = `SELECT id, name, age, genre, city, bio, img FROM users
+  let query = `SELECT id, name, age, genre, city, bio, img, intention FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ?`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
   if (genre !== "Tous") {
     query += " AND genre = ?";
     params.push(genre);
+  }
+  if (intention && intention !== "Toutes") {
+    query += " AND intention = ?";
+    params.push(intention);
   }
 
   const profiles = db.prepare(query).all(...params);
