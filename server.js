@@ -19,10 +19,17 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   age INTEGER DEFAULT 18,
+  birthdate TEXT DEFAULT '',
   genre TEXT DEFAULT 'Non précisé',
+  genre_recherche TEXT DEFAULT 'Tous',
   city TEXT DEFAULT '',
+  profession TEXT DEFAULT '',
+  taille INTEGER,
   bio TEXT DEFAULT '',
   img TEXT DEFAULT '',
+  photos TEXT DEFAULT '[]',
+  interests TEXT DEFAULT '[]',
+  langues TEXT DEFAULT '[]',
   intention TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -53,12 +60,35 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 `);
 
-// Migration douce : si la base existait déjà avant l'ajout de la colonne "intention",
-// on l'ajoute maintenant sans effacer aucune donnée existante.
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN intention TEXT DEFAULT ''`);
-} catch (e) {
-  // La colonne existe déjà : rien à faire, c'est normal après le premier déploiement.
+// Migration douce : si la base existait déjà avant l'ajout de ces colonnes,
+// on les ajoute maintenant sans effacer aucune donnée existante.
+const newColumns = [
+  "birthdate TEXT DEFAULT ''",
+  "genre_recherche TEXT DEFAULT 'Tous'",
+  "profession TEXT DEFAULT ''",
+  "taille INTEGER",
+  "photos TEXT DEFAULT '[]'",
+  "interests TEXT DEFAULT '[]'",
+  "langues TEXT DEFAULT '[]'",
+  "intention TEXT DEFAULT ''",
+];
+for (const col of newColumns) {
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN ${col}`);
+  } catch (e) {
+    // La colonne existe déjà : rien à faire, c'est normal après le premier déploiement.
+  }
+}
+
+function calculateAge(birthdate) {
+  if (!birthdate) return null;
+  const dob = new Date(birthdate);
+  if (isNaN(dob.getTime())) return null;
+  const today = new Date();
+  let age = today.getFullYear() - dob.getFullYear();
+  const m = today.getMonth() - dob.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) age--;
+  return age;
 }
 
 const app = express();
@@ -86,12 +116,30 @@ function authMiddleware(req, res, next) {
 function publicUser(u) {
   if (!u) return null;
   const { password_hash, ...rest } = u;
-  return rest;
+  return {
+    ...rest,
+    photos: safeParseArray(u.photos),
+    interests: safeParseArray(u.interests),
+    langues: safeParseArray(u.langues),
+  };
+}
+
+function safeParseArray(str) {
+  try {
+    const parsed = JSON.parse(str);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 // ---------- Auth routes ----------
 app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password, intention } = req.body || {};
+  const {
+    name, email, password, intention,
+    birthdate, genre, genre_recherche, city, profession, taille,
+    bio, photos, interests, langues,
+  } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: "Nom, email et mot de passe sont requis." });
   }
@@ -99,9 +147,20 @@ app.post("/api/auth/register", async (req, res) => {
   if (existing) return res.status(409).json({ error: "Un compte existe déjà avec cet email." });
 
   const hash = await bcrypt.hash(password, 10);
+  const age = calculateAge(birthdate);
+  const photosArr = Array.isArray(photos) ? photos : [];
   const info = db
-    .prepare("INSERT INTO users (name, email, password_hash, intention) VALUES (?, ?, ?, ?)")
-    .run(name, email, hash, intention || "");
+    .prepare(
+      `INSERT INTO users (name, email, password_hash, intention, birthdate, age, genre, genre_recherche,
+        city, profession, taille, bio, img, photos, interests, langues)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      name, email, hash, intention || "", birthdate || "", age || 18,
+      genre || "Non précisé", genre_recherche || "Tous", city || "",
+      profession || "", taille || null, bio || "", photosArr[0] || "",
+      JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || [])
+    );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   res.json({ token: signToken(user), user: publicUser(user) });
 });
@@ -122,12 +181,27 @@ app.get("/api/me", authMiddleware, (req, res) => {
 });
 
 app.put("/api/me", authMiddleware, (req, res) => {
-  const { name, age, genre, city, bio, img, intention } = req.body || {};
+  const {
+    name, genre, genre_recherche, city, bio, img, intention,
+    birthdate, profession, taille, photos, interests, langues,
+  } = req.body || {};
+  const age = birthdate ? calculateAge(birthdate) : null;
+  const primaryImg = photos && photos.length ? photos[0] : img;
   db.prepare(
-    `UPDATE users SET name = COALESCE(?, name), age = COALESCE(?, age), genre = COALESCE(?, genre),
-     city = COALESCE(?, city), bio = COALESCE(?, bio), img = COALESCE(?, img),
-     intention = COALESCE(?, intention) WHERE id = ?`
-  ).run(name, age, genre, city, bio, img, intention, req.userId);
+    `UPDATE users SET name = COALESCE(?, name), genre = COALESCE(?, genre),
+     genre_recherche = COALESCE(?, genre_recherche), city = COALESCE(?, city),
+     bio = COALESCE(?, bio), img = COALESCE(?, img), intention = COALESCE(?, intention),
+     birthdate = COALESCE(?, birthdate), age = COALESCE(?, age), profession = COALESCE(?, profession),
+     taille = COALESCE(?, taille), photos = COALESCE(?, photos),
+     interests = COALESCE(?, interests), langues = COALESCE(?, langues)
+     WHERE id = ?`
+  ).run(
+    name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
+    photos ? JSON.stringify(photos) : null,
+    interests ? JSON.stringify(interests) : null,
+    langues ? JSON.stringify(langues) : null,
+    req.userId
+  );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
   res.json({ user: publicUser(user) });
 });
@@ -144,7 +218,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const exclude = [req.userId, ...alreadySwiped];
   const placeholders = exclude.map(() => "?").join(",");
 
-  let query = `SELECT id, name, age, genre, city, bio, img, intention FROM users
+  let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ?`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
@@ -157,7 +231,12 @@ app.get("/api/discover", authMiddleware, (req, res) => {
     params.push(intention);
   }
 
-  const profiles = db.prepare(query).all(...params);
+  const profiles = db.prepare(query).all(...params).map((p) => ({
+    ...p,
+    photos: safeParseArray(p.photos),
+    interests: safeParseArray(p.interests),
+    langues: safeParseArray(p.langues),
+  }));
   res.json({ profiles });
 });
 
@@ -221,6 +300,34 @@ app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+app.delete("/api/me", authMiddleware, async (req, res) => {
+  const { password } = req.body || {};
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
+  if (!user) return res.status(404).json({ error: "Compte introuvable." });
+
+  if (password) {
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Mot de passe incorrect." });
+  }
+
+  const matchIds = db
+    .prepare("SELECT id FROM matches WHERE user_a_id = ? OR user_b_id = ?")
+    .all(req.userId, req.userId)
+    .map((m) => m.id);
+
+  const deleteAll = db.transaction(() => {
+    for (const matchId of matchIds) {
+      db.prepare("DELETE FROM messages WHERE match_id = ?").run(matchId);
+    }
+    db.prepare("DELETE FROM matches WHERE user_a_id = ? OR user_b_id = ?").run(req.userId, req.userId);
+    db.prepare("DELETE FROM swipes WHERE from_user_id = ? OR to_user_id = ?").run(req.userId, req.userId);
+    db.prepare("DELETE FROM users WHERE id = ?").run(req.userId);
+  });
+  deleteAll();
+
+  res.json({ deleted: true });
+});
 
 app.listen(PORT, () => {
   console.log(`API de l'appli de rencontre lancée sur http://localhost:${PORT}`);
