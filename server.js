@@ -7,6 +7,7 @@ const Database = require("better-sqlite3");
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 
 const db = new Database("dating_app.db");
 db.pragma("journal_mode = WAL");
@@ -31,6 +32,8 @@ CREATE TABLE IF NOT EXISTS users (
   interests TEXT DEFAULT '[]',
   langues TEXT DEFAULT '[]',
   intention TEXT DEFAULT '',
+  verification_status TEXT DEFAULT 'none',
+  verification_selfie TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -71,6 +74,8 @@ const newColumns = [
   "interests TEXT DEFAULT '[]'",
   "langues TEXT DEFAULT '[]'",
   "intention TEXT DEFAULT ''",
+  "verification_status TEXT DEFAULT 'none'",
+  "verification_selfie TEXT DEFAULT ''",
 ];
 for (const col of newColumns) {
   try {
@@ -111,6 +116,14 @@ function authMiddleware(req, res, next) {
   } catch {
     return res.status(401).json({ error: "Session invalide, reconnecte-toi." });
   }
+}
+
+function adminMiddleware(req, res, next) {
+  const key = req.headers["x-admin-key"] || "";
+  if (!ADMIN_SECRET || key !== ADMIN_SECRET) {
+    return res.status(401).json({ error: "Accès administrateur refusé." });
+  }
+  next();
 }
 
 function publicUser(u) {
@@ -218,7 +231,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const exclude = [req.userId, ...alreadySwiped];
   const placeholders = exclude.map(() => "?").join(",");
 
-  let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues FROM users
+  let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ?`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
@@ -300,6 +313,32 @@ app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// ---------- Vérification d'identité (badge) ----------
+app.post("/api/verification/submit", authMiddleware, (req, res) => {
+  const { selfieUrl } = req.body || {};
+  if (!selfieUrl) return res.status(400).json({ error: "Photo selfie manquante." });
+  db.prepare(
+    "UPDATE users SET verification_status = 'pending', verification_selfie = ? WHERE id = ?"
+  ).run(selfieUrl, req.userId);
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
+  res.json({ user: publicUser(user) });
+});
+
+app.get("/api/admin/verifications", adminMiddleware, (req, res) => {
+  const pending = db
+    .prepare("SELECT id, name, email, img, photos, verification_selfie, verification_status FROM users WHERE verification_status = 'pending'")
+    .all()
+    .map((u) => ({ ...u, photos: safeParseArray(u.photos) }));
+  res.json({ pending });
+});
+
+app.post("/api/admin/verifications/:userId/decision", adminMiddleware, (req, res) => {
+  const { approve } = req.body || {};
+  const status = approve ? "verified" : "rejected";
+  db.prepare("UPDATE users SET verification_status = ? WHERE id = ?").run(status, req.params.userId);
+  res.json({ status });
+});
 
 app.delete("/api/me", authMiddleware, async (req, res) => {
   const { password } = req.body || {};
