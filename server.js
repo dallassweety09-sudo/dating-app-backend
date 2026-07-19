@@ -226,7 +226,9 @@ app.post("/api/auth/google", async (req, res) => {
     user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   }
 
-  res.json({ token: signToken(user), user: publicUser(user), isNewAccount: !user.intention });
+  const publicU = publicUser(user);
+  const needsProfileCompletion = !user.birthdate || !user.intention || publicU.photos.length < 2;
+  res.json({ token: signToken(user), user: publicU, needsProfileCompletion });
 });
 
 // ---------- Profile ----------
