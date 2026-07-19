@@ -4,10 +4,12 @@ const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const Database = require("better-sqlite3");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 // DB_PATH : en local, un simple fichier suffit. En production sur Railway, cette variable
 // doit pointer vers un dossier monté sur un Volume permanent (ex: /data/dating_app.db),
 // sinon la base repart de zéro à chaque nouveau déploiement.
@@ -189,6 +191,42 @@ app.post("/api/auth/login", async (req, res) => {
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: "Email ou mot de passe incorrect." });
   res.json({ token: signToken(user), user: publicUser(user) });
+});
+
+app.post("/api/auth/google", async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: "Jeton Google manquant." });
+  if (!GOOGLE_CLIENT_ID) return res.status(500).json({ error: "Connexion Google non configurée côté serveur." });
+
+  let payload;
+  try {
+    const verifyRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
+    if (!verifyRes.ok) throw new Error("invalid");
+    payload = await verifyRes.json();
+  } catch {
+    return res.status(401).json({ error: "Jeton Google invalide." });
+  }
+
+  if (payload.aud !== GOOGLE_CLIENT_ID) {
+    return res.status(401).json({ error: "Jeton Google non destiné à cette application." });
+  }
+  if (payload.email_verified !== "true" && payload.email_verified !== true) {
+    return res.status(401).json({ error: "Email Google non vérifié." });
+  }
+
+  const email = payload.email;
+  let user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+
+  if (!user) {
+    const randomPassword = crypto.randomBytes(24).toString("hex");
+    const hash = await bcrypt.hash(randomPassword, 10);
+    const info = db
+      .prepare("INSERT INTO users (name, email, password_hash, img) VALUES (?, ?, ?, ?)")
+      .run(payload.name || email.split("@")[0], email, hash, payload.picture || "");
+    user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
+  }
+
+  res.json({ token: signToken(user), user: publicUser(user), isNewAccount: !user.intention });
 });
 
 // ---------- Profile ----------
