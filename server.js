@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS users (
   intention TEXT DEFAULT '',
   verification_status TEXT DEFAULT 'none',
   verification_selfie TEXT DEFAULT '',
+  plan TEXT DEFAULT 'free',
+  plan_expires_at TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -82,6 +84,8 @@ const newColumns = [
   "intention TEXT DEFAULT ''",
   "verification_status TEXT DEFAULT 'none'",
   "verification_selfie TEXT DEFAULT ''",
+  "plan TEXT DEFAULT 'free'",
+  "plan_expires_at TEXT DEFAULT ''",
 ];
 for (const col of newColumns) {
   try {
@@ -100,6 +104,21 @@ function calculateAge(birthdate) {
   const m = today.getMonth() - dob.getMonth();
   if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) age--;
   return age;
+}
+
+function dailyLikeLimit(genre) {
+  if (genre === "Femme") return 40;
+  return 20; // Homme et autres cas
+}
+
+function countTodayLikes(userId) {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as n FROM swipes
+       WHERE from_user_id = ? AND action IN ('like','superlike') AND date(created_at) = date('now')`
+    )
+    .get(userId);
+  return row.n;
 }
 
 const app = express();
@@ -304,6 +323,22 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     return res.status(400).json({ error: "Paramètres invalides." });
   }
 
+  const user = db.prepare("SELECT genre, plan FROM users WHERE id = ?").get(req.userId);
+  const isPremium = user?.plan && user.plan !== "free";
+
+  if ((action === "like" || action === "superlike") && !isPremium) {
+    const limit = dailyLikeLimit(user?.genre);
+    const used = countTodayLikes(req.userId);
+    if (used >= limit) {
+      return res.status(403).json({
+        error: "Limite quotidienne de likes atteinte.",
+        code: "LIKE_LIMIT_REACHED",
+        limit,
+        used,
+      });
+    }
+  }
+
   db.prepare(
     `INSERT INTO swipes (from_user_id, to_user_id, action) VALUES (?, ?, ?)
      ON CONFLICT(from_user_id, to_user_id) DO UPDATE SET action = excluded.action`
@@ -354,6 +389,20 @@ app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
     .run(req.params.matchId, req.userId, text.trim());
   const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(info.lastInsertRowid);
   res.json({ message });
+});
+
+app.get("/api/me/limits", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT genre, plan FROM users WHERE id = ?").get(req.userId);
+  const isPremium = user?.plan && user.plan !== "free";
+  const limit = dailyLikeLimit(user?.genre);
+  const used = countTodayLikes(req.userId);
+  res.json({
+    plan: user?.plan || "free",
+    unlimited: !!isPremium,
+    limit,
+    used,
+    remaining: isPremium ? null : Math.max(0, limit - used),
+  });
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
