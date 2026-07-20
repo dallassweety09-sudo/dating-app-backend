@@ -70,6 +70,24 @@ CREATE TABLE IF NOT EXISTS messages (
   is_read INTEGER DEFAULT 0,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS blocks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  blocker_id INTEGER NOT NULL,
+  blocked_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(blocker_id, blocked_id)
+);
+
+CREATE TABLE IF NOT EXISTS reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reporter_id INTEGER NOT NULL,
+  reported_id INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  details TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 `);
 
 // Migration douce : si la base existait déjà avant l'ajout de ces colonnes,
@@ -297,7 +315,10 @@ app.get("/api/discover", authMiddleware, (req, res) => {
     .all(req.userId)
     .map((r) => r.to_user_id);
 
-  const exclude = [req.userId, ...alreadySwiped];
+  const blockedByMe = db.prepare("SELECT blocked_id FROM blocks WHERE blocker_id = ?").all(req.userId).map((r) => r.blocked_id);
+  const blockedMe = db.prepare("SELECT blocker_id FROM blocks WHERE blocked_id = ?").all(req.userId).map((r) => r.blocker_id);
+
+  const exclude = [req.userId, ...alreadySwiped, ...blockedByMe, ...blockedMe];
   const placeholders = exclude.map(() => "?").join(",");
 
   let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status FROM users
@@ -412,6 +433,67 @@ app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
     .run(req.params.matchId, req.userId, text.trim());
   const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(info.lastInsertRowid);
   res.json({ message });
+});
+
+// ---------- Blocage & signalement ----------
+app.post("/api/block/:userId", authMiddleware, (req, res) => {
+  const targetId = Number(req.params.userId);
+  if (targetId === req.userId) return res.status(400).json({ error: "Action impossible." });
+
+  db.prepare("INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)").run(req.userId, targetId);
+
+  // On retire aussi tout match et messages existants entre les deux personnes.
+  const match = db
+    .prepare("SELECT id FROM matches WHERE (user_a_id = ? AND user_b_id = ?) OR (user_a_id = ? AND user_b_id = ?)")
+    .get(req.userId, targetId, targetId, req.userId);
+  if (match) {
+    db.prepare("DELETE FROM messages WHERE match_id = ?").run(match.id);
+    db.prepare("DELETE FROM matches WHERE id = ?").run(match.id);
+  }
+
+  res.json({ blocked: true });
+});
+
+app.delete("/api/block/:userId", authMiddleware, (req, res) => {
+  db.prepare("DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?").run(req.userId, Number(req.params.userId));
+  res.json({ blocked: false });
+});
+
+app.get("/api/blocked", authMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT u.id, u.name, u.img FROM blocks b JOIN users u ON u.id = b.blocked_id WHERE b.blocker_id = ?`
+    )
+    .all(req.userId);
+  res.json({ blocked: rows });
+});
+
+app.post("/api/report", authMiddleware, (req, res) => {
+  const { reportedId, reason, details } = req.body || {};
+  if (!reportedId || !reason) return res.status(400).json({ error: "Motif de signalement requis." });
+  db.prepare(
+    "INSERT INTO reports (reporter_id, reported_id, reason, details) VALUES (?, ?, ?, ?)"
+  ).run(req.userId, Number(reportedId), reason, details || "");
+  res.json({ reported: true });
+});
+
+app.get("/api/admin/reports", adminMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT r.*, ru.name as reporter_name, tu.name as reported_name, tu.email as reported_email
+       FROM reports r
+       JOIN users ru ON ru.id = r.reporter_id
+       JOIN users tu ON tu.id = r.reported_id
+       WHERE r.status = 'pending'
+       ORDER BY r.created_at DESC`
+    )
+    .all();
+  res.json({ reports: rows });
+});
+
+app.post("/api/admin/reports/:reportId/resolve", adminMiddleware, (req, res) => {
+  db.prepare("UPDATE reports SET status = 'resolved' WHERE id = ?").run(req.params.reportId);
+  res.json({ ok: true });
 });
 
 app.get("/api/me/limits", authMiddleware, (req, res) => {
