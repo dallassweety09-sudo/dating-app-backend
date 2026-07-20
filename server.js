@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS messages (
   match_id INTEGER NOT NULL,
   sender_id INTEGER NOT NULL,
   text TEXT NOT NULL,
+  is_read INTEGER DEFAULT 0,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 `);
@@ -93,6 +94,11 @@ for (const col of newColumns) {
   } catch (e) {
     // La colonne existe déjà : rien à faire, c'est normal après le premier déploiement.
   }
+}
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 0`);
+} catch (e) {
+  // Déjà présente, rien à faire.
 }
 
 function calculateAge(birthdate) {
@@ -364,13 +370,28 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
 app.get("/api/matches", authMiddleware, (req, res) => {
   const rows = db
     .prepare(
-      `SELECT m.id as match_id, u.id, u.name, u.age, u.city, u.img
+      `SELECT m.id as match_id, u.id, u.name, u.age, u.city, u.img,
+         (SELECT text FROM messages WHERE match_id = m.id ORDER BY created_at DESC LIMIT 1) as last_message,
+         (SELECT created_at FROM messages WHERE match_id = m.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+         (SELECT COUNT(*) FROM messages WHERE match_id = m.id AND sender_id != ? AND is_read = 0) as unread_count
        FROM matches m
        JOIN users u ON u.id = CASE WHEN m.user_a_id = ? THEN m.user_b_id ELSE m.user_a_id END
-       WHERE m.user_a_id = ? OR m.user_b_id = ?`
+       WHERE m.user_a_id = ? OR m.user_b_id = ?
+       ORDER BY COALESCE(last_message_at, m.created_at) DESC`
     )
-    .all(req.userId, req.userId, req.userId);
+    .all(req.userId, req.userId, req.userId, req.userId);
   res.json({ matches: rows });
+});
+
+app.get("/api/notifications/summary", authMiddleware, (req, res) => {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as unread FROM messages msg
+       JOIN matches m ON m.id = msg.match_id
+       WHERE (m.user_a_id = ? OR m.user_b_id = ?) AND msg.sender_id != ? AND msg.is_read = 0`
+    )
+    .get(req.userId, req.userId, req.userId);
+  res.json({ unreadMessages: row.unread });
 });
 
 // ---------- Messages ----------
@@ -378,6 +399,8 @@ app.get("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
   const messages = db
     .prepare("SELECT * FROM messages WHERE match_id = ? ORDER BY created_at ASC")
     .all(req.params.matchId);
+  // On marque comme lus tous les messages de l'autre personne dès qu'on ouvre la conversation.
+  db.prepare("UPDATE messages SET is_read = 1 WHERE match_id = ? AND sender_id != ?").run(req.params.matchId, req.userId);
   res.json({ messages });
 });
 
@@ -385,7 +408,7 @@ app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
   const { text } = req.body || {};
   if (!text || !text.trim()) return res.status(400).json({ error: "Message vide." });
   const info = db
-    .prepare("INSERT INTO messages (match_id, sender_id, text) VALUES (?, ?, ?)")
+    .prepare("INSERT INTO messages (match_id, sender_id, text, is_read) VALUES (?, ?, ?, 0)")
     .run(req.params.matchId, req.userId, text.trim());
   const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(info.lastInsertRowid);
   res.json({ message });
