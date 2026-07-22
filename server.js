@@ -88,6 +88,14 @@ CREATE TABLE IF NOT EXISTS reports (
   status TEXT DEFAULT 'pending',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS coin_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 `);
 
 // Migration douce : si la base existait déjà avant l'ajout de ces colonnes,
@@ -105,6 +113,11 @@ const newColumns = [
   "verification_selfie TEXT DEFAULT ''",
   "plan TEXT DEFAULT 'free'",
   "plan_expires_at TEXT DEFAULT ''",
+  "latitude REAL",
+  "longitude REAL",
+  "invisible INTEGER DEFAULT 0",
+  "coins INTEGER DEFAULT 20",
+  "boosted_until TEXT DEFAULT ''",
 ];
 for (const col of newColumns) {
   try {
@@ -143,6 +156,19 @@ function countTodayLikes(userId) {
     )
     .get(userId);
   return row.n;
+}
+
+function distanceKm(lat1, lon1, lat2, lon2) {
+  if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return null;
+  const toRad = (v) => (v * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
 }
 
 const app = express();
@@ -284,6 +310,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
   const {
     name, genre, genre_recherche, city, bio, img, intention,
     birthdate, profession, taille, photos, interests, langues,
+    latitude, longitude, invisible,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
   const primaryImg = photos && photos.length ? photos[0] : img;
@@ -293,13 +320,17 @@ app.put("/api/me", authMiddleware, (req, res) => {
      bio = COALESCE(?, bio), img = COALESCE(?, img), intention = COALESCE(?, intention),
      birthdate = COALESCE(?, birthdate), age = COALESCE(?, age), profession = COALESCE(?, profession),
      taille = COALESCE(?, taille), photos = COALESCE(?, photos),
-     interests = COALESCE(?, interests), langues = COALESCE(?, langues)
+     interests = COALESCE(?, interests), langues = COALESCE(?, langues),
+     latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude),
+     invisible = COALESCE(?, invisible)
      WHERE id = ?`
   ).run(
     name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
     photos ? JSON.stringify(photos) : null,
     interests ? JSON.stringify(interests) : null,
     langues ? JSON.stringify(langues) : null,
+    latitude ?? null, longitude ?? null,
+    invisible === undefined ? null : (invisible ? 1 : 0),
     req.userId
   );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
@@ -308,7 +339,11 @@ app.put("/api/me", authMiddleware, (req, res) => {
 
 // ---------- Discover (avec filtres) ----------
 app.get("/api/discover", authMiddleware, (req, res) => {
-  const { genre = "Tous", ageMin = 18, ageMax = 99, intention = "" } = req.query;
+  const {
+    genre = "Tous", ageMin = 18, ageMax = 99, intention = "",
+    verifiedOnly = "false", langue = "", tailleMin = "", tailleMax = "", commonInterests = "false",
+    maxDistance = "",
+  } = req.query;
 
   const alreadySwiped = db
     .prepare("SELECT to_user_id FROM swipes WHERE from_user_id = ?")
@@ -321,8 +356,9 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const exclude = [req.userId, ...alreadySwiped, ...blockedByMe, ...blockedMe];
   const placeholders = exclude.map(() => "?").join(",");
 
-  let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status FROM users
-    WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ?`;
+  let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
+      verification_status, latitude, longitude, boosted_until FROM users
+    WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0)`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
   if (genre !== "Tous") {
@@ -333,24 +369,79 @@ app.get("/api/discover", authMiddleware, (req, res) => {
     query += " AND intention = ?";
     params.push(intention);
   }
+  if (verifiedOnly === "true") {
+    query += " AND verification_status = 'verified'";
+  }
+  if (tailleMin) {
+    query += " AND taille >= ?";
+    params.push(Number(tailleMin));
+  }
+  if (tailleMax) {
+    query += " AND taille <= ?";
+    params.push(Number(tailleMax));
+  }
 
-  const profiles = db.prepare(query).all(...params).map((p) => ({
-    ...p,
-    photos: safeParseArray(p.photos),
-    interests: safeParseArray(p.interests),
-    langues: safeParseArray(p.langues),
-  }));
+  const me = db.prepare("SELECT latitude, longitude, interests FROM users WHERE id = ?").get(req.userId);
+
+  let profiles = db.prepare(query).all(...params).map((p) => {
+    const dist = distanceKm(me?.latitude, me?.longitude, p.latitude, p.longitude);
+    return {
+      ...p,
+      photos: safeParseArray(p.photos),
+      interests: safeParseArray(p.interests),
+      langues: safeParseArray(p.langues),
+      distance_km: dist == null ? null : Math.round(dist * 10) / 10,
+      is_boosted: !!(p.boosted_until && new Date(p.boosted_until + "Z") > new Date()),
+      latitude: undefined,
+      longitude: undefined,
+      boosted_until: undefined,
+    };
+  });
+
+  // Filtre langue : correspondance insensible à la casse sur la liste de langues parlées.
+  if (langue) {
+    const needle = langue.trim().toLowerCase();
+    profiles = profiles.filter((p) => p.langues.some((l) => l.toLowerCase().includes(needle)));
+  }
+
+  // Filtre centres d'intérêt communs : compare avec les centres d'intérêt de l'utilisateur connecté.
+  if (commonInterests === "true") {
+    const myInterests = safeParseArray(me?.interests).map((i) => i.toLowerCase());
+    if (myInterests.length > 0) {
+      profiles = profiles.filter((p) => p.interests.some((i) => myInterests.includes(i.toLowerCase())));
+    }
+  }
+
+  // Filtre distance max (uniquement appliqué si on connaît la distance réelle du profil).
+  if (maxDistance) {
+    const max = Number(maxDistance);
+    profiles = profiles.filter((p) => p.distance_km == null || p.distance_km <= max);
+  }
+
+  // Les profils boostés remontent en premier, puis on trie par proximité quand elle est connue.
+  profiles.sort((a, b) => {
+    if (a.is_boosted !== b.is_boosted) return a.is_boosted ? -1 : 1;
+    if (a.distance_km == null && b.distance_km == null) return 0;
+    if (a.distance_km == null) return 1;
+    if (b.distance_km == null) return -1;
+    return a.distance_km - b.distance_km;
+  });
+
   res.json({ profiles });
 });
 
 // ---------- Swipe + détection de match ----------
+const SUPERLIKE_COST = 10;
+const BOOST_COST = 50;
+const BOOST_DURATION_MIN = 30;
+
 app.post("/api/swipe", authMiddleware, (req, res) => {
   const { toUserId, action } = req.body || {};
   if (!toUserId || !["like", "pass", "superlike"].includes(action)) {
     return res.status(400).json({ error: "Paramètres invalides." });
   }
 
-  const user = db.prepare("SELECT genre, plan FROM users WHERE id = ?").get(req.userId);
+  const user = db.prepare("SELECT genre, plan, coins FROM users WHERE id = ?").get(req.userId);
   const isPremium = user?.plan && user.plan !== "free";
 
   if ((action === "like" || action === "superlike") && !isPremium) {
@@ -364,6 +455,14 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
         used,
       });
     }
+  }
+
+  if (action === "superlike") {
+    if ((user?.coins || 0) < SUPERLIKE_COST) {
+      return res.status(402).json({ error: "Pas assez de Lovinia Coins pour un Super Like.", code: "INSUFFICIENT_COINS", cost: SUPERLIKE_COST });
+    }
+    db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(SUPERLIKE_COST, req.userId);
+    db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -SUPERLIKE_COST, "Super Like envoyé");
   }
 
   db.prepare(
@@ -385,6 +484,30 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
   }
 
   res.json({ matched });
+});
+
+app.post("/api/swipe/undo", authMiddleware, (req, res) => {
+  const last = db
+    .prepare("SELECT * FROM swipes WHERE from_user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
+    .get(req.userId);
+  if (!last) return res.status(404).json({ error: "Rien à annuler." });
+
+  // Si ce swipe avait déjà créé un match, on le retire aussi (avec ses messages).
+  const [a, b] = [req.userId, last.to_user_id].sort((x, y) => x - y);
+  const match = db.prepare("SELECT id FROM matches WHERE user_a_id = ? AND user_b_id = ?").get(a, b);
+  if (match) {
+    db.prepare("DELETE FROM messages WHERE match_id = ?").run(match.id);
+    db.prepare("DELETE FROM matches WHERE id = ?").run(match.id);
+  }
+
+  db.prepare("DELETE FROM swipes WHERE id = ?").run(last.id);
+
+  const profile = db
+    .prepare("SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status FROM users WHERE id = ?")
+    .get(last.to_user_id);
+  if (profile) profile.photos = safeParseArray(profile.photos), profile.interests = safeParseArray(profile.interests), profile.langues = safeParseArray(profile.langues);
+
+  res.json({ restored: profile || null });
 });
 
 // ---------- Matchs ----------
@@ -494,6 +617,38 @@ app.get("/api/admin/reports", adminMiddleware, (req, res) => {
 app.post("/api/admin/reports/:reportId/resolve", adminMiddleware, (req, res) => {
   db.prepare("UPDATE reports SET status = 'resolved' WHERE id = ?").run(req.params.reportId);
   res.json({ ok: true });
+});
+
+// ---------- Visiteurs du profil ----------
+app.get("/api/visitors", authMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT u.id, u.name, u.age, u.img, MAX(s.created_at) as visited_at
+       FROM swipes s JOIN users u ON u.id = s.from_user_id
+       WHERE s.to_user_id = ?
+       GROUP BY u.id
+       ORDER BY visited_at DESC
+       LIMIT 50`
+    )
+    .all(req.userId);
+  res.json({ visitors: rows });
+});
+
+// ---------- Lovinia Coins ----------
+app.get("/api/me/coins", authMiddleware, (req, res) => {
+  const row = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
+  res.json({ coins: row?.coins || 0 });
+});
+
+app.post("/api/boost", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
+  if ((user?.coins || 0) < BOOST_COST) {
+    return res.status(402).json({ error: "Pas assez de Lovinia Coins pour un boost.", code: "INSUFFICIENT_COINS", cost: BOOST_COST });
+  }
+  const until = new Date(Date.now() + BOOST_DURATION_MIN * 60000).toISOString().slice(0, 19).replace("T", " ");
+  db.prepare("UPDATE users SET coins = coins - ?, boosted_until = ? WHERE id = ?").run(BOOST_COST, until, req.userId);
+  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -BOOST_COST, "Boost de profil");
+  res.json({ boostedUntil: until });
 });
 
 app.get("/api/me/limits", authMiddleware, (req, res) => {
