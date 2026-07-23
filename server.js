@@ -416,6 +416,31 @@ app.get("/api/me", authMiddleware, (req, res) => {
   res.json({ user: publicUser(user) });
 });
 
+app.get("/api/users/:userId/profile", authMiddleware, (req, res) => {
+  const targetId = Number(req.params.userId);
+  const match = db
+    .prepare("SELECT id FROM matches WHERE (user_a_id = ? AND user_b_id = ?) OR (user_a_id = ? AND user_b_id = ?)")
+    .get(req.userId, targetId, targetId, req.userId);
+  if (!match) return res.status(403).json({ error: "Vous n'êtes pas matchés avec cette personne." });
+
+  const user = db
+    .prepare(
+      `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
+        verification_status FROM users WHERE id = ?`
+    )
+    .get(targetId);
+  if (!user) return res.status(404).json({ error: "Profil introuvable." });
+
+  res.json({
+    profile: {
+      ...user,
+      photos: safeParseArray(user.photos),
+      interests: safeParseArray(user.interests),
+      langues: safeParseArray(user.langues),
+    },
+  });
+});
+
 app.put("/api/me", authMiddleware, (req, res) => {
   const {
     name, genre, genre_recherche, city, bio, img, intention,
