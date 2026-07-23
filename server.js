@@ -122,56 +122,7 @@ CREATE TABLE IF NOT EXISTS coin_transactions (
   reason TEXT NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE TABLE IF NOT EXISTS gift_types (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  emoji TEXT NOT NULL,
-  name TEXT NOT NULL,
-  cost INTEGER NOT NULL,
-  active INTEGER DEFAULT 1,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS media_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  url TEXT NOT NULL,
-  type TEXT DEFAULT 'photo',
-  gift_count INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS gifts_sent (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  gift_type_id INTEGER NOT NULL,
-  sender_id INTEGER NOT NULL,
-  recipient_id INTEGER NOT NULL,
-  media_id INTEGER,
-  cost INTEGER NOT NULL,
-  recipient_share INTEGER NOT NULL,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS app_settings (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
 `);
-
-// Cadeaux par défaut, uniquement à la toute première création de la table.
-const giftCount = db.prepare("SELECT COUNT(*) as n FROM gift_types").get().n;
-if (giftCount === 0) {
-  const defaultGifts = [
-    ["🌹", "Rose", 5], ["❤️", "Cœur", 5], ["☕", "Café", 8], ["🍫", "Chocolat", 10],
-    ["🧸", "Ours en peluche", 20], ["💎", "Diamant", 100], ["👑", "Couronne", 150],
-    ["🎁", "Cadeau", 30], ["🚗", "Voiture", 300], ["✈️", "Voyage", 500], ["💍", "Bague", 800],
-  ];
-  const insertGift = db.prepare("INSERT INTO gift_types (emoji, name, cost) VALUES (?, ?, ?)");
-  for (const [emoji, name, cost] of defaultGifts) insertGift.run(emoji, name, cost);
-}
-if (!db.prepare("SELECT value FROM app_settings WHERE key = 'gift_commission_percent'").get()) {
-  db.prepare("INSERT INTO app_settings (key, value) VALUES ('gift_commission_percent', '30')").run();
-}
 
 // Migration douce : si la base existait déjà avant l'ajout de ces colonnes,
 // on les ajoute maintenant sans effacer aucune donnée existante.
@@ -201,9 +152,6 @@ const newColumns = [
   "private_photos TEXT DEFAULT '[]'",
   "suspended INTEGER DEFAULT 0",
   "travel_active INTEGER DEFAULT 0",
-  "accept_gifts INTEGER DEFAULT 1",
-  "gift_senders_restriction TEXT DEFAULT 'everyone'",
-  "hide_gift_count INTEGER DEFAULT 0",
 ];
 for (const col of newColumns) {
   try {
@@ -670,6 +618,32 @@ app.get("/api/matches", authMiddleware, (req, res) => {
   res.json({ matches: rows });
 });
 
+// Fiche profil complète de l'autre personne d'un match (photos, bio, tags...),
+// accessible uniquement si un match existe bien entre les deux utilisateurs.
+app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.matchId);
+  if (!match) return res.status(404).json({ error: "Match introuvable." });
+  if (match.user_a_id !== req.userId && match.user_b_id !== req.userId) {
+    return res.status(403).json({ error: "Accès refusé." });
+  }
+  const otherId = match.user_a_id === req.userId ? match.user_b_id : match.user_a_id;
+  const p = db
+    .prepare(
+      `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
+         verification_status FROM users WHERE id = ?`
+    )
+    .get(otherId);
+  if (!p) return res.status(404).json({ error: "Profil introuvable." });
+  res.json({
+    profile: {
+      ...p,
+      photos: safeParseArray(p.photos),
+      interests: safeParseArray(p.interests),
+      langues: safeParseArray(p.langues),
+    },
+  });
+});
+
 app.get("/api/notifications/summary", authMiddleware, (req, res) => {
   const row = db
     .prepare(
@@ -818,173 +792,6 @@ app.get("/api/admin/stats", adminMiddleware, (req, res) => {
   const pendingVerifications = db.prepare("SELECT COUNT(*) as n FROM users WHERE verification_status = 'pending'").get().n;
   const newUsersToday = db.prepare("SELECT COUNT(*) as n FROM users WHERE date(created_at) = date('now')").get().n;
   res.json({ totalUsers, totalMatches, totalMessages, pendingReports, pendingVerifications, newUsersToday });
-});
-
-// ---------- Galerie (photos/vidéos giftables) ----------
-app.get("/api/gallery/:userId", authMiddleware, (req, res) => {
-  const items = db
-    .prepare("SELECT * FROM media_items WHERE user_id = ? ORDER BY created_at DESC")
-    .all(req.params.userId);
-  res.json({ items });
-});
-
-app.post("/api/gallery", authMiddleware, (req, res) => {
-  const { url, type } = req.body || {};
-  if (!url) return res.status(400).json({ error: "URL manquante." });
-  const info = db
-    .prepare("INSERT INTO media_items (user_id, url, type) VALUES (?, ?, ?)")
-    .run(req.userId, url, type === "video" ? "video" : "photo");
-  const item = db.prepare("SELECT * FROM media_items WHERE id = ?").get(info.lastInsertRowid);
-  res.json({ item });
-});
-
-app.delete("/api/gallery/:itemId", authMiddleware, (req, res) => {
-  db.prepare("DELETE FROM media_items WHERE id = ? AND user_id = ?").run(req.params.itemId, req.userId);
-  res.json({ ok: true });
-});
-
-// ---------- Boutique de cadeaux ----------
-app.get("/api/gifts/catalog", authMiddleware, (req, res) => {
-  const gifts = db.prepare("SELECT * FROM gift_types WHERE active = 1 ORDER BY cost ASC").all();
-  res.json({ gifts });
-});
-
-app.post("/api/gifts/send", authMiddleware, (req, res) => {
-  const { giftTypeId, recipientId, mediaId } = req.body || {};
-  if (!giftTypeId || !recipientId) return res.status(400).json({ error: "Paramètres manquants." });
-  if (Number(recipientId) === req.userId) return res.status(400).json({ error: "Action impossible." });
-
-  const gift = db.prepare("SELECT * FROM gift_types WHERE id = ? AND active = 1").get(giftTypeId);
-  if (!gift) return res.status(404).json({ error: "Ce cadeau n'existe plus." });
-
-  const sender = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
-  if ((sender?.coins || 0) < gift.cost) {
-    return res.status(402).json({ error: "Pas assez de Lovinia Coins.", code: "INSUFFICIENT_COINS", cost: gift.cost });
-  }
-
-  const recipient = db.prepare("SELECT verification_status, accept_gifts, gift_senders_restriction FROM users WHERE id = ?").get(recipientId);
-  if (!recipient) return res.status(404).json({ error: "Destinataire introuvable." });
-  if (recipient.verification_status !== "verified") {
-    return res.status(403).json({ error: "Seuls les profils vérifiés peuvent recevoir des cadeaux." });
-  }
-  if (!recipient.accept_gifts) {
-    return res.status(403).json({ error: "Cette personne n'accepte pas les cadeaux pour le moment." });
-  }
-  if (recipient.gift_senders_restriction === "verified_only") {
-    const senderStatus = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(req.userId);
-    if (senderStatus?.verification_status !== "verified") {
-      return res.status(403).json({ error: "Cette personne n'accepte les cadeaux que des profils vérifiés." });
-    }
-  }
-
-  const commissionPercent = Number(db.prepare("SELECT value FROM app_settings WHERE key = 'gift_commission_percent'").get()?.value || 30);
-  const recipientShare = Math.round(gift.cost * (100 - commissionPercent) / 100);
-
-  const sendGift = db.transaction(() => {
-    db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(gift.cost, req.userId);
-    db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -gift.cost, `Cadeau envoyé : ${gift.name}`);
-
-    db.prepare("UPDATE users SET coins = coins + ? WHERE id = ?").run(recipientShare, recipientId);
-    db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipientId, recipientShare, `Cadeau reçu : ${gift.name}`);
-
-    db.prepare(
-      "INSERT INTO gifts_sent (gift_type_id, sender_id, recipient_id, media_id, cost, recipient_share) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(gift.id, req.userId, recipientId, mediaId || null, gift.cost, recipientShare);
-
-    if (mediaId) {
-      db.prepare("UPDATE media_items SET gift_count = gift_count + 1 WHERE id = ?").run(mediaId);
-    }
-  });
-  sendGift();
-
-  res.json({ sent: true, gift });
-});
-
-app.get("/api/gifts/media/:mediaId", authMiddleware, (req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT g.id, gt.emoji, gt.name, u.name as sender_name, g.created_at
-       FROM gifts_sent g JOIN gift_types gt ON gt.id = g.gift_type_id JOIN users u ON u.id = g.sender_id
-       WHERE g.media_id = ? ORDER BY g.created_at DESC LIMIT 30`
-    )
-    .all(req.params.mediaId);
-  res.json({ gifts: rows });
-});
-
-// ---------- Portefeuille (Wallet) ----------
-app.get("/api/me/wallet", authMiddleware, (req, res) => {
-  const user = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
-  const receivedGifts = db
-    .prepare(
-      `SELECT g.id, gt.emoji, gt.name, g.recipient_share, g.created_at, u.name as sender_name
-       FROM gifts_sent g JOIN gift_types gt ON gt.id = g.gift_type_id JOIN users u ON u.id = g.sender_id
-       WHERE g.recipient_id = ? ORDER BY g.created_at DESC LIMIT 50`
-    )
-    .all(req.userId);
-  const totalEarned = db.prepare("SELECT COALESCE(SUM(recipient_share),0) as n FROM gifts_sent WHERE recipient_id = ?").get(req.userId).n;
-  const history = db
-    .prepare("SELECT amount, reason, created_at FROM coin_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50")
-    .all(req.userId);
-  res.json({ balance: user?.coins || 0, receivedGifts, totalEarned, history });
-});
-
-// ---------- Réglages de réception des cadeaux ----------
-app.put("/api/me/gift-settings", authMiddleware, (req, res) => {
-  const { acceptGifts, gift_senders_restriction, hideGiftCount } = req.body || {};
-  db.prepare(
-    `UPDATE users SET accept_gifts = COALESCE(?, accept_gifts),
-     gift_senders_restriction = COALESCE(?, gift_senders_restriction),
-     hide_gift_count = COALESCE(?, hide_gift_count) WHERE id = ?`
-  ).run(
-    acceptGifts === undefined ? null : (acceptGifts ? 1 : 0),
-    gift_senders_restriction || null,
-    hideGiftCount === undefined ? null : (hideGiftCount ? 1 : 0),
-    req.userId
-  );
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
-  res.json({ user: publicUser(user) });
-});
-
-// ---------- Admin : gestion des cadeaux ----------
-app.get("/api/admin/gifts", adminMiddleware, (req, res) => {
-  const gifts = db.prepare("SELECT * FROM gift_types ORDER BY cost ASC").all();
-  const commission = db.prepare("SELECT value FROM app_settings WHERE key = 'gift_commission_percent'").get()?.value || "30";
-  res.json({ gifts, commissionPercent: Number(commission) });
-});
-
-app.post("/api/admin/gifts", adminMiddleware, (req, res) => {
-  const { emoji, name, cost } = req.body || {};
-  if (!emoji || !name || !cost) return res.status(400).json({ error: "Champs manquants." });
-  const info = db.prepare("INSERT INTO gift_types (emoji, name, cost) VALUES (?, ?, ?)").run(emoji, name, Number(cost));
-  res.json({ gift: db.prepare("SELECT * FROM gift_types WHERE id = ?").get(info.lastInsertRowid) });
-});
-
-app.put("/api/admin/gifts/:giftId", adminMiddleware, (req, res) => {
-  const { emoji, name, cost, active } = req.body || {};
-  db.prepare(
-    `UPDATE gift_types SET emoji = COALESCE(?, emoji), name = COALESCE(?, name),
-     cost = COALESCE(?, cost), active = COALESCE(?, active) WHERE id = ?`
-  ).run(emoji || null, name || null, cost ? Number(cost) : null, active === undefined ? null : (active ? 1 : 0), req.params.giftId);
-  res.json({ gift: db.prepare("SELECT * FROM gift_types WHERE id = ?").get(req.params.giftId) });
-});
-
-app.delete("/api/admin/gifts/:giftId", adminMiddleware, (req, res) => {
-  db.prepare("UPDATE gift_types SET active = 0 WHERE id = ?").run(req.params.giftId);
-  res.json({ ok: true });
-});
-
-app.put("/api/admin/gift-commission", adminMiddleware, (req, res) => {
-  const { percent } = req.body || {};
-  if (percent === undefined || percent < 0 || percent > 100) return res.status(400).json({ error: "Pourcentage invalide." });
-  db.prepare("INSERT INTO app_settings (key, value) VALUES ('gift_commission_percent', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(percent));
-  res.json({ commissionPercent: Number(percent) });
-});
-
-app.get("/api/admin/gifts-stats", adminMiddleware, (req, res) => {
-  const totalSent = db.prepare("SELECT COUNT(*) as n FROM gifts_sent").get().n;
-  const totalCoinsSpent = db.prepare("SELECT COALESCE(SUM(cost),0) as n FROM gifts_sent").get().n;
-  const totalCommission = db.prepare("SELECT COALESCE(SUM(cost - recipient_share),0) as n FROM gifts_sent").get().n;
-  res.json({ totalSent, totalCoinsSpent, totalCommission });
 });
 
 // ---------- Album privé ----------
