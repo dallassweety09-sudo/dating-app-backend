@@ -5,11 +5,19 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const Database = require("better-sqlite3");
 const crypto = require("crypto");
+const webpush = require("web-push");
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:contact@lovinia.fr";
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+}
 // DB_PATH : en local, un simple fichier suffit. En production sur Railway, cette variable
 // doit pointer vers un dossier monté sur un Volume permanent (ex: /data/dating_app.db),
 // sinon la base repart de zéro à chaque nouveau déploiement.
@@ -89,6 +97,24 @@ CREATE TABLE IF NOT EXISTS reports (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS private_album_access (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_id INTEGER NOT NULL,
+  requester_id INTEGER NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(owner_id, requester_id)
+);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS coin_transactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -118,6 +144,14 @@ const newColumns = [
   "invisible INTEGER DEFAULT 0",
   "coins INTEGER DEFAULT 20",
   "boosted_until TEXT DEFAULT ''",
+  "hide_exact_distance INTEGER DEFAULT 0",
+  "blocked_locations TEXT DEFAULT '[]'",
+  "travel_city TEXT DEFAULT ''",
+  "travel_lat REAL",
+  "travel_lng REAL",
+  "private_photos TEXT DEFAULT '[]'",
+  "suspended INTEGER DEFAULT 0",
+  "travel_active INTEGER DEFAULT 0",
 ];
 for (const col of newColumns) {
   try {
@@ -186,6 +220,9 @@ function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: "Non authentifié." });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    const user = db.prepare("SELECT suspended FROM users WHERE id = ?").get(payload.id);
+    if (!user) return res.status(401).json({ error: "Compte introuvable." });
+    if (user.suspended) return res.status(403).json({ error: "Ce compte a été suspendu." });
     req.userId = payload.id;
     next();
   } catch {
@@ -209,6 +246,8 @@ function publicUser(u) {
     photos: safeParseArray(u.photos),
     interests: safeParseArray(u.interests),
     langues: safeParseArray(u.langues),
+    blocked_locations: safeParseArray(u.blocked_locations),
+    private_photos: safeParseArray(u.private_photos),
   };
 }
 
@@ -218,6 +257,24 @@ function safeParseArray(str) {
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
+  }
+}
+
+async function sendPushToUser(userId, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return; // Notifications push non configurées.
+  const subs = db.prepare("SELECT * FROM push_subscriptions WHERE user_id = ?").all(userId);
+  for (const sub of subs) {
+    const pushSubscription = {
+      endpoint: sub.endpoint,
+      keys: { p256dh: sub.p256dh, auth: sub.auth },
+    };
+    try {
+      await webpush.sendNotification(pushSubscription, JSON.stringify(payload));
+    } catch (err) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        db.prepare("DELETE FROM push_subscriptions WHERE id = ?").run(sub.id);
+      }
+    }
   }
 }
 
@@ -259,6 +316,7 @@ app.post("/api/auth/login", async (req, res) => {
   if (!user) return res.status(401).json({ error: "Email ou mot de passe incorrect." });
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: "Email ou mot de passe incorrect." });
+  if (user.suspended) return res.status(403).json({ error: "Ce compte a été suspendu." });
   res.json({ token: signToken(user), user: publicUser(user) });
 });
 
@@ -311,6 +369,8 @@ app.put("/api/me", authMiddleware, (req, res) => {
     name, genre, genre_recherche, city, bio, img, intention,
     birthdate, profession, taille, photos, interests, langues,
     latitude, longitude, invisible,
+    hideExactDistance, blockedLocations, privatePhotos,
+    travelActive, travelCity, travelLat, travelLng,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
   const primaryImg = photos && photos.length ? photos[0] : img;
@@ -322,7 +382,14 @@ app.put("/api/me", authMiddleware, (req, res) => {
      taille = COALESCE(?, taille), photos = COALESCE(?, photos),
      interests = COALESCE(?, interests), langues = COALESCE(?, langues),
      latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude),
-     invisible = COALESCE(?, invisible)
+     invisible = COALESCE(?, invisible),
+     hide_exact_distance = COALESCE(?, hide_exact_distance),
+     blocked_locations = COALESCE(?, blocked_locations),
+     private_photos = COALESCE(?, private_photos),
+     travel_active = COALESCE(?, travel_active),
+     travel_city = COALESCE(?, travel_city),
+     travel_lat = COALESCE(?, travel_lat),
+     travel_lng = COALESCE(?, travel_lng)
      WHERE id = ?`
   ).run(
     name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
@@ -331,6 +398,11 @@ app.put("/api/me", authMiddleware, (req, res) => {
     langues ? JSON.stringify(langues) : null,
     latitude ?? null, longitude ?? null,
     invisible === undefined ? null : (invisible ? 1 : 0),
+    hideExactDistance === undefined ? null : (hideExactDistance ? 1 : 0),
+    blockedLocations ? JSON.stringify(blockedLocations) : null,
+    privatePhotos ? JSON.stringify(privatePhotos) : null,
+    travelActive === undefined ? null : (travelActive ? 1 : 0),
+    travelCity ?? null, travelLat ?? null, travelLng ?? null,
     req.userId
   );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
@@ -357,8 +429,8 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const placeholders = exclude.map(() => "?").join(",");
 
   let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
-      verification_status, latitude, longitude, boosted_until FROM users
-    WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0)`;
+      verification_status, latitude, longitude, boosted_until, hide_exact_distance FROM users
+    WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0)`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
   if (genre !== "Tous") {
@@ -381,22 +453,35 @@ app.get("/api/discover", authMiddleware, (req, res) => {
     params.push(Number(tailleMax));
   }
 
-  const me = db.prepare("SELECT latitude, longitude, interests FROM users WHERE id = ?").get(req.userId);
+  const me = db.prepare("SELECT latitude, longitude, interests, travel_active, travel_lat, travel_lng, blocked_locations FROM users WHERE id = ?").get(req.userId);
+  const myLat = me?.travel_active ? me.travel_lat : me?.latitude;
+  const myLng = me?.travel_active ? me.travel_lng : me?.longitude;
 
   let profiles = db.prepare(query).all(...params).map((p) => {
-    const dist = distanceKm(me?.latitude, me?.longitude, p.latitude, p.longitude);
+    const dist = distanceKm(myLat, myLng, p.latitude, p.longitude);
+    let distanceKmRounded = dist == null ? null : Math.round(dist * 10) / 10;
+    if (distanceKmRounded != null && p.hide_exact_distance) {
+      distanceKmRounded = Math.max(1, Math.round(distanceKmRounded / 5) * 5);
+    }
     return {
       ...p,
       photos: safeParseArray(p.photos),
       interests: safeParseArray(p.interests),
       langues: safeParseArray(p.langues),
-      distance_km: dist == null ? null : Math.round(dist * 10) / 10,
+      distance_km: distanceKmRounded,
       is_boosted: !!(p.boosted_until && new Date(p.boosted_until + "Z") > new Date()),
       latitude: undefined,
       longitude: undefined,
       boosted_until: undefined,
+      hide_exact_distance: undefined,
     };
   });
+
+  // Filtre pays/villes bloqués par l'utilisateur connecté.
+  const blockedLocations = safeParseArray(me?.blocked_locations).map((l) => l.toLowerCase());
+  if (blockedLocations.length > 0) {
+    profiles = profiles.filter((p) => !blockedLocations.some((loc) => (p.city || "").toLowerCase().includes(loc)));
+  }
 
   // Filtre langue : correspondance insensible à la casse sur la liste de langues parlées.
   if (langue) {
@@ -480,6 +565,12 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
       const [a, b] = [req.userId, toUserId].sort((x, y) => x - y);
       db.prepare("INSERT OR IGNORE INTO matches (user_a_id, user_b_id) VALUES (?, ?)").run(a, b);
       matched = true;
+      const me = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+      sendPushToUser(toUserId, {
+        title: "Nouveau match sur Lovinia 💕",
+        body: `${me?.name || "Quelqu'un"} et toi vous êtes plu !`,
+        url: "/",
+      }).catch(() => {});
     }
   }
 
@@ -556,6 +647,18 @@ app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
     .run(req.params.matchId, req.userId, text.trim());
   const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(info.lastInsertRowid);
   res.json({ message });
+
+  // Notification push au destinataire (ne bloque pas la réponse).
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.matchId);
+  if (match) {
+    const recipientId = match.user_a_id === req.userId ? match.user_b_id : match.user_a_id;
+    const sender = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+    sendPushToUser(recipientId, {
+      title: sender?.name || "Nouveau message",
+      body: text.trim().slice(0, 120),
+      url: "/",
+    }).catch(() => {});
+  }
 });
 
 // ---------- Blocage & signalement ----------
@@ -617,6 +720,117 @@ app.get("/api/admin/reports", adminMiddleware, (req, res) => {
 app.post("/api/admin/reports/:reportId/resolve", adminMiddleware, (req, res) => {
   db.prepare("UPDATE reports SET status = 'resolved' WHERE id = ?").run(req.params.reportId);
   res.json({ ok: true });
+});
+
+app.get("/api/admin/users", adminMiddleware, (req, res) => {
+  const search = `%${req.query.search || ""}%`;
+  const rows = db
+    .prepare(
+      `SELECT id, name, email, genre, city, plan, suspended, verification_status, created_at
+       FROM users WHERE name LIKE ? OR email LIKE ? ORDER BY created_at DESC LIMIT 100`
+    )
+    .all(search, search);
+  res.json({ users: rows });
+});
+
+app.post("/api/admin/users/:userId/suspend", adminMiddleware, (req, res) => {
+  db.prepare("UPDATE users SET suspended = 1 WHERE id = ?").run(req.params.userId);
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/users/:userId/reactivate", adminMiddleware, (req, res) => {
+  db.prepare("UPDATE users SET suspended = 0 WHERE id = ?").run(req.params.userId);
+  res.json({ ok: true });
+});
+
+app.delete("/api/admin/users/:userId", adminMiddleware, (req, res) => {
+  const id = req.params.userId;
+  const matchIds = db.prepare("SELECT id FROM matches WHERE user_a_id = ? OR user_b_id = ?").all(id, id).map((m) => m.id);
+  const deleteAll = db.transaction(() => {
+    for (const matchId of matchIds) db.prepare("DELETE FROM messages WHERE match_id = ?").run(matchId);
+    db.prepare("DELETE FROM matches WHERE user_a_id = ? OR user_b_id = ?").run(id, id);
+    db.prepare("DELETE FROM swipes WHERE from_user_id = ? OR to_user_id = ?").run(id, id);
+    db.prepare("DELETE FROM blocks WHERE blocker_id = ? OR blocked_id = ?").run(id, id);
+    db.prepare("DELETE FROM reports WHERE reporter_id = ? OR reported_id = ?").run(id, id);
+    db.prepare("DELETE FROM users WHERE id = ?").run(id);
+  });
+  deleteAll();
+  res.json({ ok: true });
+});
+
+app.get("/api/admin/stats", adminMiddleware, (req, res) => {
+  const totalUsers = db.prepare("SELECT COUNT(*) as n FROM users").get().n;
+  const totalMatches = db.prepare("SELECT COUNT(*) as n FROM matches").get().n;
+  const totalMessages = db.prepare("SELECT COUNT(*) as n FROM messages").get().n;
+  const pendingReports = db.prepare("SELECT COUNT(*) as n FROM reports WHERE status = 'pending'").get().n;
+  const pendingVerifications = db.prepare("SELECT COUNT(*) as n FROM users WHERE verification_status = 'pending'").get().n;
+  const newUsersToday = db.prepare("SELECT COUNT(*) as n FROM users WHERE date(created_at) = date('now')").get().n;
+  res.json({ totalUsers, totalMatches, totalMessages, pendingReports, pendingVerifications, newUsersToday });
+});
+
+// ---------- Album privé ----------
+app.post("/api/private-album/request/:ownerId", authMiddleware, (req, res) => {
+  const ownerId = Number(req.params.ownerId);
+  if (ownerId === req.userId) return res.status(400).json({ error: "Action impossible." });
+  db.prepare(
+    `INSERT INTO private_album_access (owner_id, requester_id, status) VALUES (?, ?, 'pending')
+     ON CONFLICT(owner_id, requester_id) DO NOTHING`
+  ).run(ownerId, req.userId);
+  res.json({ requested: true });
+});
+
+app.get("/api/private-album/requests", authMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT pa.id, pa.requester_id, u.name, u.img, pa.status, pa.created_at
+       FROM private_album_access pa JOIN users u ON u.id = pa.requester_id
+       WHERE pa.owner_id = ? AND pa.status = 'pending' ORDER BY pa.created_at DESC`
+    )
+    .all(req.userId);
+  res.json({ requests: rows });
+});
+
+app.post("/api/private-album/requests/:requestId/decision", authMiddleware, (req, res) => {
+  const { approve } = req.body || {};
+  const request = db.prepare("SELECT * FROM private_album_access WHERE id = ? AND owner_id = ?").get(req.params.requestId, req.userId);
+  if (!request) return res.status(404).json({ error: "Demande introuvable." });
+  db.prepare("UPDATE private_album_access SET status = ? WHERE id = ?").run(approve ? "approved" : "denied", req.params.requestId);
+  res.json({ ok: true });
+});
+
+app.get("/api/private-album/:ownerId", authMiddleware, (req, res) => {
+  const ownerId = Number(req.params.ownerId);
+  if (ownerId === req.userId) {
+    const me = db.prepare("SELECT private_photos FROM users WHERE id = ?").get(req.userId);
+    return res.json({ photos: safeParseArray(me?.private_photos), status: "approved" });
+  }
+  const access = db.prepare("SELECT status FROM private_album_access WHERE owner_id = ? AND requester_id = ?").get(ownerId, req.userId);
+  if (access?.status === "approved") {
+    const owner = db.prepare("SELECT private_photos FROM users WHERE id = ?").get(ownerId);
+    return res.json({ photos: safeParseArray(owner?.private_photos), status: "approved" });
+  }
+  res.json({ photos: [], status: access?.status || "none" });
+});
+
+// ---------- Notifications push ----------
+app.get("/api/push/vapid-public-key", (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post("/api/push/subscribe", authMiddleware, (req, res) => {
+  const { endpoint, keys } = req.body?.subscription || req.body || {};
+  if (!endpoint || !keys?.p256dh || !keys?.auth) return res.status(400).json({ error: "Abonnement invalide." });
+  db.prepare(
+    `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)
+     ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`
+  ).run(req.userId, endpoint, keys.p256dh, keys.auth);
+  res.json({ subscribed: true });
+});
+
+app.post("/api/push/unsubscribe", authMiddleware, (req, res) => {
+  const { endpoint } = req.body || {};
+  if (endpoint) db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(endpoint);
+  res.json({ unsubscribed: true });
 });
 
 // ---------- Visiteurs du profil ----------
