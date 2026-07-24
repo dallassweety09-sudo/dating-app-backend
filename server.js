@@ -122,6 +122,33 @@ CREATE TABLE IF NOT EXISTS coin_transactions (
   reason TEXT NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS posts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  media_url TEXT NOT NULL,
+  media_type TEXT NOT NULL DEFAULT 'photo',
+  caption TEXT DEFAULT '',
+  comments_enabled INTEGER DEFAULT 1,
+  comments_permission TEXT DEFAULT 'everyone',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS post_likes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(post_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS post_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 `);
 
 // Migration douce : si la base existait déjà avant l'ajout de ces colonnes,
@@ -642,6 +669,149 @@ app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
       langues: safeParseArray(p.langues),
     },
   });
+});
+
+// ---------- PUBLICATIONS (photos/vidéos), LIKES ET COMMENTAIRES ----------
+
+function isBlockedEitherWay(userA, userB) {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)`
+    )
+    .get(userA, userB, userB, userA);
+  return !!row;
+}
+
+function areMatched(userA, userB) {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM matches WHERE (user_a_id = ? AND user_b_id = ?) OR (user_a_id = ? AND user_b_id = ?)`
+    )
+    .get(userA, userB, userB, userA);
+  return !!row;
+}
+
+function decoratePost(post, requesterId) {
+  const likeCount = db.prepare("SELECT COUNT(*) c FROM post_likes WHERE post_id = ?").get(post.id).c;
+  const commentCount = db.prepare("SELECT COUNT(*) c FROM post_comments WHERE post_id = ?").get(post.id).c;
+  const likedByMe = !!db.prepare("SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?").get(post.id, requesterId);
+  return { ...post, likeCount, commentCount, likedByMe };
+}
+
+// Créer une publication (photo ou vidéo) sur son propre profil
+app.post("/api/posts", authMiddleware, (req, res) => {
+  const { mediaUrl, mediaType, caption } = req.body || {};
+  if (!mediaUrl) return res.status(400).json({ error: "Média manquant." });
+  const type = mediaType === "video" ? "video" : "photo";
+  const result = db
+    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption) VALUES (?, ?, ?, ?)")
+    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500));
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(result.lastInsertRowid);
+  res.json({ post: decoratePost(post, req.userId) });
+});
+
+// Mes propres publications (pour les gérer)
+app.get("/api/posts/mine", authMiddleware, (req, res) => {
+  const rows = db.prepare("SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC").all(req.userId);
+  res.json({ posts: rows.map((p) => decoratePost(p, req.userId)) });
+});
+
+// Publications d'un autre utilisateur (affichées sur son profil)
+app.get("/api/users/:userId/posts", authMiddleware, (req, res) => {
+  const targetId = Number(req.params.userId);
+  if (isBlockedEitherWay(req.userId, targetId)) return res.status(403).json({ error: "Accès refusé." });
+  const rows = db.prepare("SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC").all(targetId);
+  res.json({ posts: rows.map((p) => decoratePost(p, req.userId)) });
+});
+
+// Supprimer sa propre publication
+app.delete("/api/posts/:postId", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (post.user_id !== req.userId) return res.status(403).json({ error: "Accès refusé." });
+  db.prepare("DELETE FROM post_comments WHERE post_id = ?").run(post.id);
+  db.prepare("DELETE FROM post_likes WHERE post_id = ?").run(post.id);
+  db.prepare("DELETE FROM posts WHERE id = ?").run(post.id);
+  res.json({ success: true });
+});
+
+// Gérer les réglages de commentaires d'une publication (activer/désactiver, qui peut commenter)
+app.put("/api/posts/:postId/settings", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (post.user_id !== req.userId) return res.status(403).json({ error: "Accès refusé." });
+  const { commentsEnabled, commentsPermission } = req.body || {};
+  const enabled = commentsEnabled === false ? 0 : 1;
+  const permission = commentsPermission === "matches" ? "matches" : "everyone";
+  db.prepare("UPDATE posts SET comments_enabled = ?, comments_permission = ? WHERE id = ?").run(enabled, permission, post.id);
+  res.json({ success: true });
+});
+
+// Aimer / retirer son like sur une publication
+app.post("/api/posts/:postId/like", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
+  const existing = db.prepare("SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?").get(post.id, req.userId);
+  if (existing) {
+    db.prepare("DELETE FROM post_likes WHERE post_id = ? AND user_id = ?").run(post.id, req.userId);
+  } else {
+    db.prepare("INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)").run(post.id, req.userId);
+    if (post.user_id !== req.userId) {
+      const liker = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+      sendPushToUser(post.user_id, { title: "Lovinia 💕", body: `${liker?.name || "Quelqu'un"} a aimé ta publication`, url: "/" });
+    }
+  }
+  const likeCount = db.prepare("SELECT COUNT(*) c FROM post_likes WHERE post_id = ?").get(post.id).c;
+  res.json({ liked: !existing, likeCount });
+});
+
+// Voir les commentaires d'une publication
+app.get("/api/posts/:postId/comments", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  const rows = db
+    .prepare(
+      `SELECT c.id, c.text, c.created_at, c.user_id, u.name, u.img
+       FROM post_comments c JOIN users u ON u.id = c.user_id
+       WHERE c.post_id = ? ORDER BY c.created_at ASC`
+    )
+    .all(post.id);
+  res.json({ comments: rows });
+});
+
+// Laisser un commentaire (soumis aux réglages du propriétaire de la publication)
+app.post("/api/posts/:postId/comments", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
+  if (!post.comments_enabled) return res.status(403).json({ error: "Les commentaires sont désactivés sur cette publication." });
+  if (post.comments_permission === "matches" && post.user_id !== req.userId && !areMatched(req.userId, post.user_id)) {
+    return res.status(403).json({ error: "Seules les personnes matchées avec cet utilisateur peuvent commenter." });
+  }
+  const text = (req.body?.text || "").trim().slice(0, 500);
+  if (!text) return res.status(400).json({ error: "Commentaire vide." });
+  const result = db.prepare("INSERT INTO post_comments (post_id, user_id, text) VALUES (?, ?, ?)").run(post.id, req.userId, text);
+  if (post.user_id !== req.userId) {
+    const commenter = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+    sendPushToUser(post.user_id, { title: "Lovinia 💕", body: `${commenter?.name || "Quelqu'un"} a commenté ta publication`, url: "/" });
+  }
+  const comment = db
+    .prepare(`SELECT c.id, c.text, c.created_at, c.user_id, u.name, u.img FROM post_comments c JOIN users u ON u.id = c.user_id WHERE c.id = ?`)
+    .get(result.lastInsertRowid);
+  res.json({ comment });
+});
+
+// Supprimer un commentaire : l'auteur du commentaire OU le propriétaire de la publication peut le faire
+app.delete("/api/posts/:postId/comments/:commentId", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  const comment = db.prepare("SELECT * FROM post_comments WHERE id = ? AND post_id = ?").get(req.params.commentId, req.params.postId);
+  if (!post || !comment) return res.status(404).json({ error: "Introuvable." });
+  if (comment.user_id !== req.userId && post.user_id !== req.userId) {
+    return res.status(403).json({ error: "Accès refusé." });
+  }
+  db.prepare("DELETE FROM post_comments WHERE id = ?").run(comment.id);
+  res.json({ success: true });
 });
 
 app.get("/api/notifications/summary", authMiddleware, (req, res) => {
