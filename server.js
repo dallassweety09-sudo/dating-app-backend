@@ -5,6 +5,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const Database = require("better-sqlite3");
 const crypto = require("crypto");
+const https = require("https");
 const webpush = require("web-push");
 
 const PORT = process.env.PORT || 4000;
@@ -131,6 +132,7 @@ CREATE TABLE IF NOT EXISTS posts (
   caption TEXT DEFAULT '',
   comments_enabled INTEGER DEFAULT 1,
   comments_permission TEXT DEFAULT 'everyone',
+  moderation_status TEXT DEFAULT 'pending',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -224,6 +226,85 @@ try {
 } catch (e) {
   // Déjà présente, rien à faire.
 }
+try {
+  db.exec(`ALTER TABLE posts ADD COLUMN moderation_status TEXT DEFAULT 'pending'`);
+  // Les publications déjà en ligne avant cette mise à jour restent visibles (approuvées rétroactivement).
+  db.exec(`UPDATE posts SET moderation_status = 'approved' WHERE moderation_status = 'pending'`);
+} catch (e) {
+  // Colonne déjà présente, rien à faire.
+}
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`);
+  db.exec(`ALTER TABLE users ADD COLUMN email_verify_token TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN terms_accepted_at TEXT`);
+  // Les comptes déjà existants avant cette mise à jour sont "graciés" : on ne les bloque pas rétroactivement.
+  db.exec(`UPDATE users SET email_verified = 1 WHERE email_verified IS NULL OR email_verified = 0`);
+} catch (e) {
+  // Colonnes déjà présentes, rien à faire.
+}
+
+// ---------- Envoi d'emails transactionnels via l'API HTTP Brevo (gratuit jusqu'à 300 emails/jour) ----------
+// Aucune dépendance npm nécessaire : simple requête HTTPS native.
+function sendTransactionalEmail({ to, toName, subject, html }) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.BREVO_API_KEY;
+    if (!apiKey) {
+      console.warn("BREVO_API_KEY manquant : email non envoyé (variable d'environnement à configurer sur Railway).");
+      return resolve({ skipped: true });
+    }
+    const fromEmail = process.env.EMAIL_FROM || "contact@lovinia.fr";
+    const fromName = process.env.EMAIL_FROM_NAME || "Lovinia";
+    const payload = JSON.stringify({
+      sender: { name: fromName, email: fromEmail },
+      to: [{ email: to, name: toName || to }],
+      subject,
+      htmlContent: html,
+    });
+    const request = https.request(
+      {
+        hostname: "api.brevo.com",
+        path: "/v3/smtp/email",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "api-key": apiKey,
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      },
+      (response) => {
+        let data = "";
+        response.on("data", (chunk) => (data += chunk));
+        response.on("end", () => {
+          if (response.statusCode >= 200 && response.statusCode < 300) resolve(data ? JSON.parse(data) : {});
+          else reject(new Error(`Brevo a renvoyé une erreur ${response.statusCode} : ${data}`));
+        });
+      }
+    );
+    request.on("error", reject);
+    request.write(payload);
+    request.end();
+  });
+}
+
+function sendVerificationEmail(email, name, token) {
+  const verifyUrl = `${process.env.FRONTEND_URL || "https://lovinia.fr"}/verify-email?token=${token}`;
+  return sendTransactionalEmail({
+    to: email,
+    toName: name,
+    subject: "Confirme ton adresse email — Lovinia 💕",
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;">
+        <h2 style="color:#1B1223;">Bienvenue sur Lovinia, ${name} 💕</h2>
+        <p style="color:#333;">Confirme ton adresse email pour activer pleinement ton compte :</p>
+        <p style="margin:24px 0;">
+          <a href="${verifyUrl}" style="background:#FF6B5B;color:#fff;padding:12px 26px;border-radius:10px;text-decoration:none;font-weight:bold;">Confirmer mon email</a>
+        </p>
+        <p style="color:#888;font-size:13px;">Ou copie ce lien dans ton navigateur : <br>${verifyUrl}</p>
+        <p style="color:#aaa;font-size:12px;margin-top:24px;">Si tu n'es pas à l'origine de cette inscription, ignore simplement cet email.</p>
+      </div>`,
+  });
+}
 
 function calculateAge(birthdate) {
   if (!birthdate) return null;
@@ -267,6 +348,39 @@ function distanceKm(lat1, lon1, lat2, lon2) {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ---------- Anti-abus (rate limiting) ----------
+// Fait maison, sans dépendance externe : limite le nombre de requêtes par IP sur une fenêtre de temps.
+const rateLimitBuckets = new Map();
+function rateLimit({ windowMs, max, keyPrefix }) {
+  return (req, res, next) => {
+    const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+    const key = `${keyPrefix}:${ip}`;
+    const now = Date.now();
+    let bucket = rateLimitBuckets.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      rateLimitBuckets.set(key, bucket);
+    }
+    bucket.count++;
+    if (bucket.count > max) {
+      res.set("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
+      return res.status(429).json({ error: "Trop de tentatives depuis cette connexion. Réessaie dans quelques minutes." });
+    }
+    next();
+  };
+}
+// Purge périodique pour éviter une fuite mémoire sur le long terme.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets) {
+    if (now > bucket.resetAt) rateLimitBuckets.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "auth" }); // inscription / connexion
+const generalRateLimit = rateLimit({ windowMs: 60 * 1000, max: 180, keyPrefix: "api" }); // toutes les routes
+app.use("/api/", generalRateLimit);
 
 // ---------- Auth helpers ----------
 function signToken(user) {
@@ -340,38 +454,54 @@ async function sendPushToUser(userId, payload) {
 }
 
 // ---------- Auth routes ----------
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authRateLimit, async (req, res) => {
   const {
     name, email, password, intention,
     birthdate, genre, genre_recherche, city, profession, taille,
-    bio, photos, interests, langues,
+    bio, photos, interests, langues, acceptedTerms,
   } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: "Nom, email et mot de passe sont requis." });
+  }
+  if (!birthdate) {
+    return res.status(400).json({ error: "La date de naissance est obligatoire." });
+  }
+  const age = calculateAge(birthdate);
+  if (age === null) {
+    return res.status(400).json({ error: "Date de naissance invalide." });
+  }
+  if (age < 18) {
+    return res.status(403).json({ error: "Lovinia est réservé aux personnes majeures (18 ans et plus).", code: "UNDERAGE" });
+  }
+  if (!acceptedTerms) {
+    return res.status(400).json({ error: "Tu dois accepter les Conditions d'utilisation et la Politique de confidentialité pour créer un compte." });
   }
   const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
   if (existing) return res.status(409).json({ error: "Un compte existe déjà avec cet email." });
 
   const hash = await bcrypt.hash(password, 10);
-  const age = calculateAge(birthdate);
   const photosArr = Array.isArray(photos) ? photos : [];
+  const emailVerifyToken = crypto.randomBytes(24).toString("hex");
   const info = db
     .prepare(
       `INSERT INTO users (name, email, password_hash, intention, birthdate, age, genre, genre_recherche,
-        city, profession, taille, bio, img, photos, interests, langues)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        city, profession, taille, bio, img, photos, interests, langues,
+        terms_accepted_at, email_verify_token, email_verified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 0)`
     )
     .run(
-      name, email, hash, intention || "", birthdate || "", age || 18,
+      name, email, hash, intention || "", birthdate, age,
       genre || "Non précisé", genre_recherche || "Tous", city || "",
       profession || "", taille || null, bio || "", photosArr[0] || "",
-      JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || [])
+      JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || []),
+      emailVerifyToken
     );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
+  sendVerificationEmail(user.email, user.name, emailVerifyToken).catch(() => {});
   res.json({ token: signToken(user), user: publicUser(user) });
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authRateLimit, async (req, res) => {
   const { email, password } = req.body || {};
   const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
   if (!user) return res.status(401).json({ error: "Email ou mot de passe incorrect." });
@@ -409,7 +539,7 @@ app.post("/api/auth/google", async (req, res) => {
     const randomPassword = crypto.randomBytes(24).toString("hex");
     const hash = await bcrypt.hash(randomPassword, 10);
     const info = db
-      .prepare("INSERT INTO users (name, email, password_hash, img) VALUES (?, ?, ?, ?)")
+      .prepare("INSERT INTO users (name, email, password_hash, img, email_verified) VALUES (?, ?, ?, ?, 1)")
       .run(payload.name || email.split("@")[0], email, hash, payload.picture || "");
     user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   }
@@ -417,6 +547,31 @@ app.post("/api/auth/google", async (req, res) => {
   const publicU = publicUser(user);
   const needsProfileCompletion = !user.birthdate || !user.intention || publicU.photos.length < 2;
   res.json({ token: signToken(user), user: publicU, needsProfileCompletion });
+});
+
+// Confirmation d'adresse email via le lien reçu par email
+app.get("/api/auth/verify-email", (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: "Lien de vérification invalide." });
+  const user = db.prepare("SELECT id FROM users WHERE email_verify_token = ?").get(token);
+  if (!user) return res.status(400).json({ error: "Ce lien est invalide ou a déjà été utilisé." });
+  db.prepare("UPDATE users SET email_verified = 1, email_verify_token = NULL WHERE id = ?").run(user.id);
+  res.json({ success: true });
+});
+
+// Renvoyer l'email de confirmation (ex: si le premier n'est pas arrivé)
+app.post("/api/auth/resend-verification", authMiddleware, authRateLimit, async (req, res) => {
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
+  if (!user) return res.status(404).json({ error: "Compte introuvable." });
+  if (user.email_verified) return res.json({ success: true, alreadyVerified: true });
+  const token = crypto.randomBytes(24).toString("hex");
+  db.prepare("UPDATE users SET email_verify_token = ? WHERE id = ?").run(token, user.id);
+  try {
+    await sendVerificationEmail(user.email, user.name, token);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "Échec de l'envoi de l'email. Réessaie dans quelques minutes." });
+  }
 });
 
 // ---------- Profile ----------
@@ -431,9 +586,15 @@ app.put("/api/me", authMiddleware, (req, res) => {
     birthdate, profession, taille, photos, interests, langues,
     latitude, longitude, invisible,
     hideExactDistance, blockedLocations, privatePhotos,
-    travelActive, travelCity, travelLat, travelLng,
+    travelActive, travelCity, travelLat, travelLng, acceptedTerms,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
+  if (birthdate && (age === null || age < 18)) {
+    return res.status(403).json({ error: "Lovinia est réservé aux personnes majeures (18 ans et plus).", code: "UNDERAGE" });
+  }
+  if (acceptedTerms) {
+    db.prepare("UPDATE users SET terms_accepted_at = CURRENT_TIMESTAMP WHERE id = ?").run(req.userId);
+  }
   const primaryImg = photos && photos.length ? photos[0] : img;
   db.prepare(
     `UPDATE users SET name = COALESCE(?, name), genre = COALESCE(?, genre),
@@ -587,8 +748,15 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     return res.status(400).json({ error: "Paramètres invalides." });
   }
 
-  const user = db.prepare("SELECT genre, plan, coins FROM users WHERE id = ?").get(req.userId);
+  const user = db.prepare("SELECT genre, plan, coins, email_verified FROM users WHERE id = ?").get(req.userId);
   const isPremium = user?.plan && user.plan !== "free";
+
+  if ((action === "like" || action === "superlike") && !user?.email_verified) {
+    return res.status(403).json({
+      error: "Confirme ton adresse email avant de pouvoir liker des profils. Vérifie ta boîte mail (et tes spams) !",
+      code: "EMAIL_NOT_VERIFIED",
+    });
+  }
 
   if ((action === "like" || action === "superlike") && !isPremium) {
     const limit = dailyLikeLimit(user?.genre);
@@ -755,7 +923,7 @@ app.get("/api/users/:userId/posts", authMiddleware, (req, res) => {
   const targetId = Number(req.params.userId);
   if (isBlockedEitherWay(req.userId, targetId)) return res.status(403).json({ error: "Accès refusé." });
   const owner = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(targetId);
-  const rows = db.prepare("SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC").all(targetId);
+  const rows = db.prepare("SELECT * FROM posts WHERE user_id = ? AND moderation_status = 'approved' ORDER BY created_at DESC").all(targetId);
   res.json({ posts: rows.map((p) => ({ ...decoratePost(p, req.userId), owner_verified: owner?.verification_status === "verified" })) });
 });
 
@@ -914,6 +1082,26 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
 });
 
 // --- Administration de la boutique (créer/modifier les cadeaux et leurs prix) ---
+// --- Modération des publications (photos/vidéos) avant mise en ligne ---
+app.get("/api/admin/posts/pending", adminMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT p.*, u.name as author_name, u.email as author_email
+       FROM posts p JOIN users u ON u.id = p.user_id
+       WHERE p.moderation_status = 'pending' ORDER BY p.created_at ASC`
+    )
+    .all();
+  res.json({ posts: rows });
+});
+
+app.post("/api/admin/posts/:postId/moderate", adminMiddleware, (req, res) => {
+  const decision = req.body?.decision === "rejected" ? "rejected" : "approved";
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  db.prepare("UPDATE posts SET moderation_status = ? WHERE id = ?").run(decision, post.id);
+  res.json({ success: true, decision });
+});
+
 app.get("/api/admin/gifts", adminMiddleware, (req, res) => {
   const gifts = db.prepare("SELECT * FROM gift_catalog ORDER BY sort_order ASC, id ASC").all();
   res.json({ gifts });
