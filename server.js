@@ -149,7 +149,34 @@ CREATE TABLE IF NOT EXISTS post_comments (
   text TEXT NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS gift_catalog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  icon TEXT NOT NULL,
+  price_coins INTEGER NOT NULL,
+  active INTEGER DEFAULT 1,
+  sort_order INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS gifts_sent (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sender_id INTEGER NOT NULL,
+  recipient_id INTEGER NOT NULL,
+  post_id INTEGER NOT NULL,
+  gift_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 `);
+
+// Cadeaux par défaut, créés une seule fois si la boutique est vide.
+if (db.prepare("SELECT COUNT(*) c FROM gift_catalog").get().c === 0) {
+  const seedGifts = db.prepare("INSERT INTO gift_catalog (name, icon, price_coins, active, sort_order) VALUES (?, ?, ?, 1, ?)");
+  seedGifts.run("Rose", "🌹", 20, 1);
+  seedGifts.run("Cœur", "❤️", 50, 2);
+  seedGifts.run("Diamant", "💎", 150, 3);
+  seedGifts.run("Couronne", "👑", 300, 4);
+}
 
 // Migration douce : si la base existait déjà avant l'ajout de ces colonnes,
 // on les ajoute maintenant sans effacer aucune donnée existante.
@@ -720,8 +747,9 @@ app.get("/api/posts/mine", authMiddleware, (req, res) => {
 app.get("/api/users/:userId/posts", authMiddleware, (req, res) => {
   const targetId = Number(req.params.userId);
   if (isBlockedEitherWay(req.userId, targetId)) return res.status(403).json({ error: "Accès refusé." });
+  const owner = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(targetId);
   const rows = db.prepare("SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC").all(targetId);
-  res.json({ posts: rows.map((p) => decoratePost(p, req.userId)) });
+  res.json({ posts: rows.map((p) => ({ ...decoratePost(p, req.userId), owner_verified: owner?.verification_status === "verified" })) });
 });
 
 // Supprimer sa propre publication
@@ -811,6 +839,106 @@ app.delete("/api/posts/:postId/comments/:commentId", authMiddleware, (req, res) 
     return res.status(403).json({ error: "Accès refusé." });
   }
   db.prepare("DELETE FROM post_comments WHERE id = ?").run(comment.id);
+  res.json({ success: true });
+});
+
+// ---------- BOUTIQUE DE CADEAUX ----------
+const GIFT_RECIPIENT_SHARE = 0.5; // Le destinataire d'un cadeau reçoit 50% de sa valeur en Coins.
+
+// Catalogue des cadeaux actifs, visible par tous les utilisateurs connectés
+app.get("/api/gifts/catalog", authMiddleware, (req, res) => {
+  const gifts = db.prepare("SELECT * FROM gift_catalog WHERE active = 1 ORDER BY sort_order ASC, price_coins ASC").all();
+  res.json({ gifts });
+});
+
+// Compteur des cadeaux reçus sur une publication (par type de cadeau)
+app.get("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT g.id as gift_id, g.name, g.icon, COUNT(*) as count
+       FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id
+       WHERE gs.post_id = ? GROUP BY g.id ORDER BY count DESC`
+    )
+    .all(req.params.postId);
+  const total = rows.reduce((sum, r) => sum + r.count, 0);
+  res.json({ gifts: rows, total });
+});
+
+// Envoyer un cadeau sur une publication
+app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (post.user_id === req.userId) return res.status(400).json({ error: "Tu ne peux pas t'envoyer un cadeau à toi-même." });
+  if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
+
+  const recipient = db.prepare("SELECT id, name, coins, verification_status FROM users WHERE id = ?").get(post.user_id);
+  if (!recipient) return res.status(404).json({ error: "Destinataire introuvable." });
+  if (recipient.verification_status !== "verified") {
+    return res.status(403).json({ error: "Seuls les profils vérifiés (badge bleu) peuvent recevoir des cadeaux." });
+  }
+
+  const gift = db.prepare("SELECT * FROM gift_catalog WHERE id = ? AND active = 1").get(req.body?.giftId);
+  if (!gift) return res.status(404).json({ error: "Ce cadeau n'existe pas ou n'est plus disponible." });
+
+  const sender = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
+  if ((sender?.coins || 0) < gift.price_coins) {
+    return res.status(402).json({ error: "Coins insuffisants pour envoyer ce cadeau.", code: "INSUFFICIENT_COINS" });
+  }
+
+  const recipientGain = Math.floor(gift.price_coins * GIFT_RECIPIENT_SHARE);
+
+  db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(gift.price_coins, req.userId);
+  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -gift.price_coins, `Cadeau envoyé : ${gift.name}`);
+
+  db.prepare("UPDATE users SET coins = coins + ? WHERE id = ?").run(recipientGain, recipient.id);
+  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipient.id, recipientGain, `Cadeau reçu : ${gift.name}`);
+
+  db.prepare("INSERT INTO gifts_sent (sender_id, recipient_id, post_id, gift_id) VALUES (?, ?, ?, ?)").run(req.userId, recipient.id, post.id, gift.id);
+
+  const senderInfo = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+  sendPushToUser(recipient.id, {
+    title: "Lovinia 💕",
+    body: `${senderInfo?.name || "Quelqu'un"} t'a envoyé un cadeau ${gift.icon} ${gift.name} !`,
+    url: "/",
+  }).catch(() => {});
+
+  const remainingCoins = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId).coins;
+  res.json({ success: true, gift, remainingCoins });
+});
+
+// --- Administration de la boutique (créer/modifier les cadeaux et leurs prix) ---
+app.get("/api/admin/gifts", adminMiddleware, (req, res) => {
+  const gifts = db.prepare("SELECT * FROM gift_catalog ORDER BY sort_order ASC, id ASC").all();
+  res.json({ gifts });
+});
+
+app.post("/api/admin/gifts", adminMiddleware, (req, res) => {
+  const { name, icon, priceCoins } = req.body || {};
+  if (!name || !icon || !priceCoins || priceCoins <= 0) {
+    return res.status(400).json({ error: "Nom, icône et prix (positif) sont requis." });
+  }
+  const maxOrder = db.prepare("SELECT MAX(sort_order) m FROM gift_catalog").get().m || 0;
+  const result = db
+    .prepare("INSERT INTO gift_catalog (name, icon, price_coins, active, sort_order) VALUES (?, ?, ?, 1, ?)")
+    .run(name.slice(0, 40), icon.slice(0, 8), Math.round(priceCoins), maxOrder + 1);
+  const gift = db.prepare("SELECT * FROM gift_catalog WHERE id = ?").get(result.lastInsertRowid);
+  res.json({ gift });
+});
+
+app.put("/api/admin/gifts/:giftId", adminMiddleware, (req, res) => {
+  const gift = db.prepare("SELECT * FROM gift_catalog WHERE id = ?").get(req.params.giftId);
+  if (!gift) return res.status(404).json({ error: "Cadeau introuvable." });
+  const name = req.body?.name ?? gift.name;
+  const icon = req.body?.icon ?? gift.icon;
+  const priceCoins = req.body?.priceCoins != null ? Math.round(req.body.priceCoins) : gift.price_coins;
+  const active = req.body?.active != null ? (req.body.active ? 1 : 0) : gift.active;
+  db.prepare("UPDATE gift_catalog SET name = ?, icon = ?, price_coins = ?, active = ? WHERE id = ?")
+    .run(name.slice(0, 40), icon.slice(0, 8), priceCoins, active, gift.id);
+  res.json({ gift: db.prepare("SELECT * FROM gift_catalog WHERE id = ?").get(gift.id) });
+});
+
+app.delete("/api/admin/gifts/:giftId", adminMiddleware, (req, res) => {
+  db.prepare("UPDATE gift_catalog SET active = 0 WHERE id = ?").run(req.params.giftId);
   res.json({ success: true });
 });
 
