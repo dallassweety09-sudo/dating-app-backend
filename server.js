@@ -219,6 +219,11 @@ try {
 } catch (e) {
   // Déjà présente, rien à faire.
 }
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN last_active_at TEXT`);
+} catch (e) {
+  // Déjà présente, rien à faire.
+}
 
 function calculateAge(birthdate) {
   if (!birthdate) return null;
@@ -278,6 +283,8 @@ function authMiddleware(req, res, next) {
     if (!user) return res.status(401).json({ error: "Compte introuvable." });
     if (user.suspended) return res.status(403).json({ error: "Ce compte a été suspendu." });
     req.userId = payload.id;
+    // Marque l'utilisateur comme actif à l'instant (sert au statut "En ligne" / "Vu il y a...").
+    db.prepare("UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE id = ?").run(payload.id);
     next();
   } catch {
     return res.status(401).json({ error: "Session invalide, reconnecte-toi." });
@@ -659,7 +666,7 @@ app.post("/api/swipe/undo", authMiddleware, (req, res) => {
 app.get("/api/matches", authMiddleware, (req, res) => {
   const rows = db
     .prepare(
-      `SELECT m.id as match_id, u.id, u.name, u.age, u.city, u.img,
+      `SELECT m.id as match_id, u.id, u.name, u.age, u.city, u.img, u.last_active_at,
          (SELECT text FROM messages WHERE match_id = m.id ORDER BY created_at DESC LIMIT 1) as last_message,
          (SELECT created_at FROM messages WHERE match_id = m.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
          (SELECT COUNT(*) FROM messages WHERE match_id = m.id AND sender_id != ? AND is_read = 0) as unread_count
@@ -684,7 +691,7 @@ app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
   const p = db
     .prepare(
       `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
-         verification_status FROM users WHERE id = ?`
+         verification_status, last_active_at FROM users WHERE id = ?`
     )
     .get(otherId);
   if (!p) return res.status(404).json({ error: "Profil introuvable." });
