@@ -835,26 +835,63 @@ app.get("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
   res.json({ messages });
 });
 
+// ---------- Détection de coordonnées personnelles dans les messages ----------
+// Objectif : empêcher l'échange de numéros de téléphone, emails, liens et pseudos
+// de réseaux sociaux tant que les DEUX personnes ne sont pas des profils vérifiés (badge bleu).
+const CONTACT_INFO_PATTERNS = [
+  // Numéro de téléphone : au moins 8 chiffres, avec ou sans indicatif, séparateurs variés
+  /(\+?\d[\s.\-]?){8,}\d/,
+  // Adresse email
+  /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+  // Lien web (http/https/www)
+  /\b(https?:\/\/|www\.)\S+/i,
+  // Réseau social nommé explicitement, suivi d'un identifiant probable
+  /\b(whatsapp|wa\.me|telegram|t\.me|instagram|insta|snapchat|snap|facebook|fb\.com|messenger|tiktok)\b\s*[:@]?\s*[\w._-]{2,}/i,
+  // Pseudo précédé de @ (identifiant réseau social)
+  /@[a-z0-9._]{3,}/i,
+];
+
+function containsContactInfo(text) {
+  return CONTACT_INFO_PATTERNS.some((re) => re.test(text));
+}
+
 app.post("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
   const { text } = req.body || {};
   if (!text || !text.trim()) return res.status(400).json({ error: "Message vide." });
+  const trimmed = text.trim();
+
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.matchId);
+  if (!match) return res.status(404).json({ error: "Match introuvable." });
+  if (match.user_a_id !== req.userId && match.user_b_id !== req.userId) {
+    return res.status(403).json({ error: "Accès refusé." });
+  }
+  const recipientId = match.user_a_id === req.userId ? match.user_b_id : match.user_a_id;
+
+  if (containsContactInfo(trimmed)) {
+    const sender = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(req.userId);
+    const recipient = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(recipientId);
+    const bothVerified = sender?.verification_status === "verified" && recipient?.verification_status === "verified";
+    if (!bothVerified) {
+      return res.status(403).json({
+        error: "Pour la sécurité de tous, l'échange de coordonnées personnelles (téléphone, email, réseaux sociaux, liens...) n'est autorisé qu'entre deux profils vérifiés (badge bleu).",
+        code: "CONTACT_INFO_BLOCKED",
+      });
+    }
+  }
+
   const info = db
     .prepare("INSERT INTO messages (match_id, sender_id, text, is_read) VALUES (?, ?, ?, 0)")
-    .run(req.params.matchId, req.userId, text.trim());
+    .run(req.params.matchId, req.userId, trimmed);
   const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(info.lastInsertRowid);
   res.json({ message });
 
   // Notification push au destinataire (ne bloque pas la réponse).
-  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.matchId);
-  if (match) {
-    const recipientId = match.user_a_id === req.userId ? match.user_b_id : match.user_a_id;
-    const sender = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
-    sendPushToUser(recipientId, {
-      title: sender?.name || "Nouveau message",
-      body: text.trim().slice(0, 120),
-      url: "/",
-    }).catch(() => {});
-  }
+  const sender = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+  sendPushToUser(recipientId, {
+    title: sender?.name || "Nouveau message",
+    body: trimmed.slice(0, 120),
+    url: "/",
+  }).catch(() => {});
 });
 
 // ---------- Blocage & signalement ----------
