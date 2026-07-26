@@ -169,6 +169,14 @@ CREATE TABLE IF NOT EXISTS gifts_sent (
   gift_id INTEGER NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS platform_revenue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  amount INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  reference_id INTEGER,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 `);
 
 // Cadeaux par défaut, créés une seule fois si la boutique est vide.
@@ -232,6 +240,13 @@ try {
   db.exec(`UPDATE posts SET moderation_status = 'approved' WHERE moderation_status = 'pending'`);
 } catch (e) {
   // Colonne déjà présente, rien à faire.
+}
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN accept_gifts INTEGER DEFAULT 1`);
+  db.exec(`ALTER TABLE users ADD COLUMN gift_senders_restriction TEXT DEFAULT 'everyone'`);
+  db.exec(`ALTER TABLE users ADD COLUMN hide_gift_count INTEGER DEFAULT 0`);
+} catch (e) {
+  // Déjà présentes, rien à faire.
 }
 try {
   db.exec(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`);
@@ -602,6 +617,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     latitude, longitude, invisible,
     hideExactDistance, blockedLocations, privatePhotos,
     travelActive, travelCity, travelLat, travelLng, acceptedTerms,
+    acceptGifts, giftSendersRestriction, hideGiftCount,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
   if (birthdate && (age === null || age < 18)) {
@@ -626,7 +642,10 @@ app.put("/api/me", authMiddleware, (req, res) => {
      travel_active = COALESCE(?, travel_active),
      travel_city = COALESCE(?, travel_city),
      travel_lat = COALESCE(?, travel_lat),
-     travel_lng = COALESCE(?, travel_lng)
+     travel_lng = COALESCE(?, travel_lng),
+     accept_gifts = COALESCE(?, accept_gifts),
+     gift_senders_restriction = COALESCE(?, gift_senders_restriction),
+     hide_gift_count = COALESCE(?, hide_gift_count)
      WHERE id = ?`
   ).run(
     name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
@@ -640,6 +659,9 @@ app.put("/api/me", authMiddleware, (req, res) => {
     privatePhotos ? JSON.stringify(privatePhotos) : null,
     travelActive === undefined ? null : (travelActive ? 1 : 0),
     travelCity ?? null, travelLat ?? null, travelLng ?? null,
+    acceptGifts === undefined ? null : (acceptGifts ? 1 : 0),
+    giftSendersRestriction ?? null,
+    hideGiftCount === undefined ? null : (hideGiftCount ? 1 : 0),
     req.userId
   );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
@@ -1033,7 +1055,7 @@ app.delete("/api/posts/:postId/comments/:commentId", authMiddleware, (req, res) 
 });
 
 // ---------- BOUTIQUE DE CADEAUX ----------
-const GIFT_RECIPIENT_SHARE = 0.5; // Le destinataire d'un cadeau reçoit 50% de sa valeur en Coins.
+const GIFT_RECIPIENT_SHARE = 0.7; // Le destinataire d'un cadeau reçoit 70% de sa valeur en Coins ; 30% reviennent à la plateforme.
 
 // Catalogue des cadeaux actifs, visible par tous les utilisateurs connectés
 app.get("/api/gifts/catalog", authMiddleware, (req, res) => {
@@ -1043,6 +1065,12 @@ app.get("/api/gifts/catalog", authMiddleware, (req, res) => {
 
 // Compteur des cadeaux reçus sur une publication (par type de cadeau)
 app.get("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT user_id FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  const owner = db.prepare("SELECT hide_gift_count FROM users WHERE id = ?").get(post.user_id);
+  if (owner?.hide_gift_count && post.user_id !== req.userId) {
+    return res.json({ gifts: [], total: 0, hidden: true });
+  }
   const rows = db
     .prepare(
       `SELECT g.id as gift_id, g.name, g.icon, COUNT(*) as count
@@ -1061,10 +1089,19 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   if (post.user_id === req.userId) return res.status(400).json({ error: "Tu ne peux pas t'envoyer un cadeau à toi-même." });
   if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
 
-  const recipient = db.prepare("SELECT id, name, coins, verification_status FROM users WHERE id = ?").get(post.user_id);
+  const recipient = db.prepare("SELECT id, name, coins, verification_status, accept_gifts, gift_senders_restriction FROM users WHERE id = ?").get(post.user_id);
   if (!recipient) return res.status(404).json({ error: "Destinataire introuvable." });
   if (recipient.verification_status !== "verified") {
     return res.status(403).json({ error: "Seuls les profils vérifiés (badge bleu) peuvent recevoir des cadeaux." });
+  }
+  if (recipient.accept_gifts === 0) {
+    return res.status(403).json({ error: "Cette personne n'accepte pas les cadeaux pour le moment." });
+  }
+  if (recipient.gift_senders_restriction === "verified_only") {
+    const sender = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(req.userId);
+    if (sender?.verification_status !== "verified") {
+      return res.status(403).json({ error: "Cette personne n'accepte les cadeaux que de la part de profils vérifiés." });
+    }
   }
 
   const gift = db.prepare("SELECT * FROM gift_catalog WHERE id = ? AND active = 1").get(req.body?.giftId);
@@ -1076,6 +1113,7 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   }
 
   const recipientGain = Math.floor(gift.price_coins * GIFT_RECIPIENT_SHARE);
+  const platformShare = gift.price_coins - recipientGain; // Les 30% restants, conservés par la plateforme.
 
   db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(gift.price_coins, req.userId);
   db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -gift.price_coins, `Cadeau envoyé : ${gift.name}`);
@@ -1084,6 +1122,7 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipient.id, recipientGain, `Cadeau reçu : ${gift.name}`);
 
   db.prepare("INSERT INTO gifts_sent (sender_id, recipient_id, post_id, gift_id) VALUES (?, ?, ?, ?)").run(req.userId, recipient.id, post.id, gift.id);
+  db.prepare("INSERT INTO platform_revenue (amount, source, reference_id) VALUES (?, ?, ?)").run(platformShare, `Commission cadeau : ${gift.name}`, gift.id);
 
   const senderInfo = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
   sendPushToUser(recipient.id, {
@@ -1115,6 +1154,14 @@ app.post("/api/admin/posts/:postId/moderate", adminMiddleware, (req, res) => {
   if (!post) return res.status(404).json({ error: "Publication introuvable." });
   db.prepare("UPDATE posts SET moderation_status = ? WHERE id = ?").run(decision, post.id);
   res.json({ success: true, decision });
+});
+
+// Revenu de la plateforme (commission de 30% sur chaque cadeau envoyé)
+app.get("/api/admin/revenue", adminMiddleware, (req, res) => {
+  const total = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM platform_revenue").get().total;
+  const recent = db.prepare("SELECT * FROM platform_revenue ORDER BY created_at DESC LIMIT 50").all();
+  const giftsSentCount = db.prepare("SELECT COUNT(*) c FROM gifts_sent").get().c;
+  res.json({ totalCoins: total, giftsSentCount, recent });
 });
 
 app.get("/api/admin/gifts", adminMiddleware, (req, res) => {
@@ -1423,6 +1470,15 @@ app.get("/api/visitors", authMiddleware, (req, res) => {
 app.get("/api/me/coins", authMiddleware, (req, res) => {
   const row = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
   res.json({ coins: row?.coins || 0 });
+});
+
+// Portefeuille : solde + historique des mouvements de Coins (gains et dépenses)
+app.get("/api/me/wallet", authMiddleware, (req, res) => {
+  const row = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
+  const transactions = db
+    .prepare("SELECT id, amount, reason, created_at FROM coin_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
+    .all(req.userId);
+  res.json({ coins: row?.coins || 0, transactions });
 });
 
 app.post("/api/boost", authMiddleware, (req, res) => {
