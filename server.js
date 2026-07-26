@@ -350,12 +350,27 @@ app.use(cors());
 app.use(express.json());
 
 // ---------- Anti-abus (rate limiting) ----------
-// Fait maison, sans dépendance externe : limite le nombre de requêtes par IP sur une fenêtre de temps.
+// Fait maison, sans dépendance externe : limite le nombre de requêtes par fenêtre de temps.
+// Clé par utilisateur connecté quand c'est possible (plus juste que l'IP seule, qui peut être
+// partagée par plusieurs personnes sur un même réseau mobile/CGNAT et déclencher de faux blocages).
 const rateLimitBuckets = new Map();
 function rateLimit({ windowMs, max, keyPrefix }) {
   return (req, res, next) => {
-    const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
-    const key = `${keyPrefix}:${ip}`;
+    let identity = null;
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (token) {
+      try {
+        identity = `user:${jwt.verify(token, JWT_SECRET).id}`;
+      } catch {
+        identity = null;
+      }
+    }
+    if (!identity) {
+      const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+      identity = `ip:${ip}`;
+    }
+    const key = `${keyPrefix}:${identity}`;
     const now = Date.now();
     let bucket = rateLimitBuckets.get(key);
     if (!bucket || now > bucket.resetAt) {
@@ -365,7 +380,7 @@ function rateLimit({ windowMs, max, keyPrefix }) {
     bucket.count++;
     if (bucket.count > max) {
       res.set("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
-      return res.status(429).json({ error: "Trop de tentatives depuis cette connexion. Réessaie dans quelques minutes." });
+      return res.status(429).json({ error: "Trop de requêtes en peu de temps. Réessaie dans quelques instants." });
     }
     next();
   };
@@ -378,8 +393,8 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: "auth" }); // inscription / connexion
-const generalRateLimit = rateLimit({ windowMs: 60 * 1000, max: 180, keyPrefix: "api" }); // toutes les routes
+const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: "auth" }); // inscription / connexion
+const generalRateLimit = rateLimit({ windowMs: 60 * 1000, max: 400, keyPrefix: "api" }); // toutes les routes, par utilisateur
 app.use("/api/", generalRateLimit);
 
 // ---------- Auth helpers ----------
