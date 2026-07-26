@@ -177,6 +177,14 @@ CREATE TABLE IF NOT EXISTS platform_revenue (
   reference_id INTEGER,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS post_views (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id INTEGER NOT NULL,
+  viewer_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(post_id, viewer_id)
+);
 `);
 
 // Cadeaux par défaut, créés une seule fois si la boutique est vide.
@@ -933,8 +941,9 @@ function areMatched(userA, userB) {
 function decoratePost(post, requesterId) {
   const likeCount = db.prepare("SELECT COUNT(*) c FROM post_likes WHERE post_id = ?").get(post.id).c;
   const commentCount = db.prepare("SELECT COUNT(*) c FROM post_comments WHERE post_id = ?").get(post.id).c;
+  const viewCount = db.prepare("SELECT COUNT(*) c FROM post_views WHERE post_id = ?").get(post.id).c;
   const likedByMe = !!db.prepare("SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?").get(post.id, requesterId);
-  return { ...post, likeCount, commentCount, likedByMe };
+  return { ...post, likeCount, commentCount, viewCount, likedByMe };
 }
 
 // Créer une publication (photo ou vidéo) sur son propre profil
@@ -1007,6 +1016,32 @@ app.post("/api/posts/:postId/like", authMiddleware, (req, res) => {
 });
 
 // Voir les commentaires d'une publication
+// Enregistre qu'un utilisateur a vu une publication (une seule fois par personne, ne gonfle pas le compteur en boucle)
+app.post("/api/posts/:postId/view", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT id, user_id FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (post.user_id !== req.userId) {
+    db.prepare("INSERT OR IGNORE INTO post_views (post_id, viewer_id) VALUES (?, ?)").run(post.id, req.userId);
+  }
+  const viewCount = db.prepare("SELECT COUNT(*) c FROM post_views WHERE post_id = ?").get(post.id).c;
+  res.json({ viewCount });
+});
+
+// Liste des personnes ayant vu une publication (réservé au propriétaire de la publication)
+app.get("/api/posts/:postId/views", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT id, user_id FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (post.user_id !== req.userId) return res.status(403).json({ error: "Accès refusé." });
+  const viewers = db
+    .prepare(
+      `SELECT u.id, u.name, u.img, pv.created_at as viewed_at
+       FROM post_views pv JOIN users u ON u.id = pv.viewer_id
+       WHERE pv.post_id = ? ORDER BY pv.created_at DESC`
+    )
+    .all(post.id);
+  res.json({ viewers, total: viewers.length });
+});
+
 app.get("/api/posts/:postId/comments", authMiddleware, (req, res) => {
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
   if (!post) return res.status(404).json({ error: "Publication introuvable." });
