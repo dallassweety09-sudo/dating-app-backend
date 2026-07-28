@@ -1599,4 +1599,13 @@ app.delete("/api/me", authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`API de l'appli de rencontre lancée sur http://localhost:${PORT}`);
+  // Diagnostic temporaire : confirme si la clé Brevo est bien vue par le serveur au démarrage,
+  // sans jamais afficher la clé complète (sécurité).
+  const brevoKey = process.env.BREVO_API_KEY;
+  if (brevoKey) {
+    console.log(`[DIAGNOSTIC] BREVO_API_KEY détectée : longueur=${brevoKey.length}, commence par "${brevoKey.slice(0, 8)}...", finit par "...${brevoKey.slice(-4)}"`);
+  } else {
+    console.log(`[DIAGNOSTIC] BREVO_API_KEY est absente ou vide au démarrage du serveur (valeur reçue : ${JSON.stringify(brevoKey)}).`);
+  }
+  console.log(`[DIAGNOSTIC] EMAIL_FROM = ${JSON.stringify(process.env.EMAIL_FROM)}`);
 });
