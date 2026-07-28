@@ -1599,13 +1599,21 @@ app.delete("/api/me", authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`API de l'appli de rencontre lancée sur http://localhost:${PORT}`);
-  // Diagnostic temporaire : confirme si la clé Brevo est bien vue par le serveur au démarrage,
-  // sans jamais afficher la clé complète (sécurité).
-  const brevoKey = process.env.BREVO_API_KEY;
-  if (brevoKey) {
-    console.log(`[DIAGNOSTIC] BREVO_API_KEY détectée : longueur=${brevoKey.length}, commence par "${brevoKey.slice(0, 8)}...", finit par "...${brevoKey.slice(-4)}"`);
-  } else {
-    console.log(`[DIAGNOSTIC] BREVO_API_KEY est absente ou vide au démarrage du serveur (valeur reçue : ${JSON.stringify(brevoKey)}).`);
+  // Diagnostic temporaire complet : vérifie TOUTES les variables attendues, pour savoir si le
+  // problème touche uniquement Brevo ou bien toutes les variables d'environnement du service.
+  const expectedVars = [
+    "BREVO_API_KEY", "EMAIL_FROM", "EMAIL_FROM_NAME", "FRONTEND_URL",
+    "JWT_SECRET", "ADMIN_SECRET", "DB_PATH", "GOOGLE_CLIENT_ID",
+    "VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY",
+  ];
+  console.log("========== [DIAGNOSTIC] État des variables d'environnement ==========");
+  for (const key of expectedVars) {
+    const val = process.env[key];
+    if (val) {
+      console.log(`[DIAGNOSTIC] ${key} = PRÉSENTE (longueur ${val.length}, commence par "${val.slice(0, 4)}...")`);
+    } else {
+      console.log(`[DIAGNOSTIC] ${key} = ABSENTE (undefined)`);
+    }
   }
-  console.log(`[DIAGNOSTIC] EMAIL_FROM = ${JSON.stringify(process.env.EMAIL_FROM)}`);
+  console.log("=======================================================================");
 });
