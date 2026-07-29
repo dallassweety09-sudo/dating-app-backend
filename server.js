@@ -265,6 +265,9 @@ try {
 } catch (e) {
   // Colonnes déjà présentes, rien à faire.
 }
+// La vérification par email est en pause pour le moment : personne ne doit rester bloqué à cause d'elle.
+// Cette ligne s'exécute à chaque démarrage (contrairement à la migration ci-dessus).
+db.exec(`UPDATE users SET email_verified = 1 WHERE email_verified = 0 OR email_verified IS NULL`);
 
 // ---------- Envoi d'emails transactionnels via l'API HTTP Brevo (gratuit jusqu'à 300 emails/jour) ----------
 // Aucune dépendance npm nécessaire : simple requête HTTPS native.
@@ -519,13 +522,16 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
 
   const hash = await bcrypt.hash(password, 10);
   const photosArr = Array.isArray(photos) ? photos : [];
+  // NOTE : la vérification par email est désactivée pour le moment (mise en pause, pas supprimée).
+  // Les nouveaux comptes sont donc marqués comme "vérifiés" par défaut (email_verified = 1) pour
+  // ne bloquer aucune fonctionnalité. Le token reste généré et stocké, prêt à être réactivé plus tard.
   const emailVerifyToken = crypto.randomBytes(24).toString("hex");
   const info = db
     .prepare(
       `INSERT INTO users (name, email, password_hash, intention, birthdate, age, genre, genre_recherche,
         city, profession, taille, bio, img, photos, interests, langues,
         terms_accepted_at, email_verify_token, email_verified)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 0)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)`
     )
     .run(
       name, email, hash, intention || "", birthdate, age,
@@ -535,7 +541,7 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
       emailVerifyToken
     );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
-  sendVerificationEmail(user.email, user.name, emailVerifyToken).catch(() => {});
+  // sendVerificationEmail(user.email, user.name, emailVerifyToken).catch(() => {}); // désactivé pour le moment
   res.json({ token: signToken(user), user: publicUser(user) });
 });
 
@@ -795,13 +801,6 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
 
   const user = db.prepare("SELECT genre, plan, coins, email_verified FROM users WHERE id = ?").get(req.userId);
   const isPremium = user?.plan && user.plan !== "free";
-
-  if ((action === "like" || action === "superlike") && !user?.email_verified) {
-    return res.status(403).json({
-      error: "Confirme ton adresse email avant de pouvoir liker des profils. Vérifie ta boîte mail (et tes spams) !",
-      code: "EMAIL_NOT_VERIFIED",
-    });
-  }
 
   if ((action === "like" || action === "superlike") && !isPremium) {
     const limit = dailyLikeLimit(user?.genre);
