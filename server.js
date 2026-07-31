@@ -185,6 +185,15 @@ CREATE TABLE IF NOT EXISTS post_views (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(post_id, viewer_id)
 );
+
+CREATE TABLE IF NOT EXISTS withdrawal_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount_coins INTEGER NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  processed_at TEXT
+);
 `);
 
 // Cadeaux par défaut, créés une seule fois si la boutique est vide.
@@ -255,6 +264,18 @@ try {
   db.exec(`ALTER TABLE users ADD COLUMN hide_gift_count INTEGER DEFAULT 0`);
 } catch (e) {
   // Déjà présentes, rien à faire.
+}
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN orientation TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN plan_expires_at TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN creator_balance INTEGER DEFAULT 0`);
+} catch (e) {
+  // Déjà présentes, rien à faire.
+}
+try {
+  db.exec(`ALTER TABLE posts ADD COLUMN is_private INTEGER DEFAULT 0`);
+} catch (e) {
+  // Déjà présente, rien à faire.
 }
 try {
   db.exec(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`);
@@ -347,6 +368,41 @@ function dailyLikeLimit(genre) {
   if (genre === "Femme") return 40;
   return 20; // Homme et autres cas
 }
+
+// ---------- Packs d'abonnement ----------
+// NOTE : le paiement réel (carte, Mobile Money, Google Play Billing) n'est pas encore branché.
+// Pour l'instant, s'abonner active immédiatement le pack (comme les Coins), en attendant l'intégration
+// d'un vrai moyen de paiement — obligatoire via Google Play Billing pour toute vente sur Android.
+const SUBSCRIPTION_PLANS = {
+  gold: {
+    name: "Pack Gold", priceUSD: 5,
+    features: [
+      "Publier des photos et vidéos privées", "Interrupteur Public/Privé sur chaque contenu",
+      "Gestion des contenus privés depuis le profil", "Statistiques des contenus privés",
+      "Réception de cadeaux sur les contenus privés", "Demande de retrait des gains",
+    ],
+  },
+  premium: {
+    name: "Pack Premium", priceUSD: 10,
+    features: [
+      "Matchs illimités", "Mise en avant du profil", "Voir qui a aimé ton profil",
+      "Filtres avancés", "Priorité dans les recherches", "Boost du profil",
+      "Plus de Super Likes", "Badge Premium", "Réduction sur les LoviCoins", "Statistiques détaillées",
+    ],
+  },
+  vip: {
+    name: "Pack VIP", priceUSD: 15,
+    features: [
+      "Tous les avantages Premium", "Consultation des photos et vidéos privées",
+      "Accès aux contenus réservés VIP", "Cadeaux VIP exclusifs", "Bonus mensuel de LoviCoins",
+      "Badge VIP animé", "Visibilité maximale", "Service client prioritaire",
+    ],
+  },
+};
+
+function isPremiumOrAbove(plan) { return plan === "premium" || plan === "vip"; }
+function isGoldOrAbove(plan) { return plan === "gold" || plan === "vip"; }
+function isVip(plan) { return plan === "vip"; }
 
 function countTodayLikes(userId) {
   const row = db
@@ -499,7 +555,7 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
   const {
     name, email, password, intention,
     birthdate, genre, genre_recherche, city, profession, taille,
-    bio, photos, interests, langues, acceptedTerms,
+    bio, photos, interests, langues, acceptedTerms, orientation,
   } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: "Nom, email et mot de passe sont requis." });
@@ -529,15 +585,16 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
   const info = db
     .prepare(
       `INSERT INTO users (name, email, password_hash, intention, birthdate, age, genre, genre_recherche,
-        city, profession, taille, bio, img, photos, interests, langues,
+        city, profession, taille, bio, img, photos, interests, langues, orientation,
         terms_accepted_at, email_verify_token, email_verified)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)`
     )
     .run(
       name, email, hash, intention || "", birthdate, age,
       genre || "Non précisé", genre_recherche || "Tous", city || "",
       profession || "", taille || null, bio || "", photosArr[0] || "",
       JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || []),
+      orientation || "",
       emailVerifyToken
     );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
@@ -942,17 +999,43 @@ function decoratePost(post, requesterId) {
   const commentCount = db.prepare("SELECT COUNT(*) c FROM post_comments WHERE post_id = ?").get(post.id).c;
   const viewCount = db.prepare("SELECT COUNT(*) c FROM post_views WHERE post_id = ?").get(post.id).c;
   const likedByMe = !!db.prepare("SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?").get(post.id, requesterId);
-  return { ...post, likeCount, commentCount, viewCount, likedByMe };
+
+  let mediaUrl = post.media_url;
+  let locked = false;
+  if (post.is_private) {
+    const isOwner = post.user_id === requesterId;
+    if (!isOwner) {
+      const requester = db.prepare("SELECT plan FROM users WHERE id = ?").get(requesterId);
+      if (!isVip(requester?.plan)) {
+        mediaUrl = null; // on ne fuite jamais l'URL réelle à qui n'a pas le droit de la voir
+        locked = true;
+      }
+    }
+  }
+  return { ...post, media_url: mediaUrl, locked, likeCount, commentCount, viewCount, likedByMe };
 }
 
 // Créer une publication (photo ou vidéo) sur son propre profil
 app.post("/api/posts", authMiddleware, (req, res) => {
-  const { mediaUrl, mediaType, caption } = req.body || {};
+  const { mediaUrl, mediaType, caption, isPrivate } = req.body || {};
   if (!mediaUrl) return res.status(400).json({ error: "Média manquant." });
   const type = mediaType === "video" ? "video" : "photo";
+
+  let privateFlag = 0;
+  if (isPrivate) {
+    const owner = db.prepare("SELECT plan, verification_status FROM users WHERE id = ?").get(req.userId);
+    if (!isGoldOrAbove(owner?.plan)) {
+      return res.status(403).json({ error: "Le Pack Gold est nécessaire pour publier du contenu privé.", code: "GOLD_REQUIRED" });
+    }
+    if (owner?.verification_status !== "verified") {
+      return res.status(403).json({ error: "Seuls les profils vérifiés (badge bleu) peuvent publier du contenu privé.", code: "VERIFICATION_REQUIRED" });
+    }
+    privateFlag = 1;
+  }
+
   const result = db
-    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption) VALUES (?, ?, ?, ?)")
-    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500));
+    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption, is_private) VALUES (?, ?, ?, ?, ?)")
+    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500), privateFlag);
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(result.lastInsertRowid);
   res.json({ post: decoratePost(post, req.userId) });
 });
@@ -1123,6 +1206,11 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   if (post.user_id === req.userId) return res.status(400).json({ error: "Tu ne peux pas t'envoyer un cadeau à toi-même." });
   if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
 
+  const senderInfo = db.prepare("SELECT name, plan FROM users WHERE id = ?").get(req.userId);
+  if (post.is_private && !isVip(senderInfo?.plan)) {
+    return res.status(403).json({ error: "Le Pack VIP est nécessaire pour interagir avec du contenu privé.", code: "VIP_REQUIRED" });
+  }
+
   const recipient = db.prepare("SELECT id, name, coins, verification_status, accept_gifts, gift_senders_restriction FROM users WHERE id = ?").get(post.user_id);
   if (!recipient) return res.status(404).json({ error: "Destinataire introuvable." });
   if (recipient.verification_status !== "verified") {
@@ -1152,13 +1240,17 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(gift.price_coins, req.userId);
   db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -gift.price_coins, `Cadeau envoyé : ${gift.name}`);
 
-  db.prepare("UPDATE users SET coins = coins + ? WHERE id = ?").run(recipientGain, recipient.id);
-  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipient.id, recipientGain, `Cadeau reçu : ${gift.name}`);
+  // Sur du contenu privé, le gain va au solde créateur (retirable), pas aux Coins classiques (dépensables dans l'app).
+  if (post.is_private) {
+    db.prepare("UPDATE users SET creator_balance = creator_balance + ? WHERE id = ?").run(recipientGain, recipient.id);
+  } else {
+    db.prepare("UPDATE users SET coins = coins + ? WHERE id = ?").run(recipientGain, recipient.id);
+  }
+  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipient.id, recipientGain, `Cadeau reçu : ${gift.name}${post.is_private ? " (contenu privé)" : ""}`);
 
   db.prepare("INSERT INTO gifts_sent (sender_id, recipient_id, post_id, gift_id) VALUES (?, ?, ?, ?)").run(req.userId, recipient.id, post.id, gift.id);
   db.prepare("INSERT INTO platform_revenue (amount, source, reference_id) VALUES (?, ?, ?)").run(platformShare, `Commission cadeau : ${gift.name}`, gift.id);
 
-  const senderInfo = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
   sendPushToUser(recipient.id, {
     title: "Lovinia 💕",
     body: `${senderInfo?.name || "Quelqu'un"} t'a envoyé un cadeau ${gift.icon} ${gift.name} !`,
@@ -1513,6 +1605,107 @@ app.get("/api/me/wallet", authMiddleware, (req, res) => {
     .prepare("SELECT id, amount, reason, created_at FROM coin_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
     .all(req.userId);
   res.json({ coins: row?.coins || 0, transactions });
+});
+
+// ---------- Abonnements (Gold / Premium / VIP) ----------
+
+// Catalogue public des 3 packs
+app.get("/api/plans", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT plan, plan_expires_at FROM users WHERE id = ?").get(req.userId);
+  res.json({ plans: SUBSCRIPTION_PLANS, currentPlan: user?.plan || "free", planExpiresAt: user?.plan_expires_at || null });
+});
+
+// S'abonner à un pack. NOTE : paiement réel pas encore branché (voir avertissement en haut du fichier
+// pour GIFT_RECIPIENT_SHARE) — active immédiatement le pack, comme un "mode démo" en attendant
+// l'intégration de Google Play Billing / Stripe / Mobile Money.
+app.post("/api/subscribe", authMiddleware, (req, res) => {
+  const planKey = req.body?.plan;
+  if (!SUBSCRIPTION_PLANS[planKey]) return res.status(400).json({ error: "Pack inconnu." });
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + 30);
+  db.prepare("UPDATE users SET plan = ?, plan_expires_at = ? WHERE id = ?").run(planKey, expiresAt.toISOString(), req.userId);
+  res.json({ success: true, plan: planKey, planExpiresAt: expiresAt.toISOString() });
+});
+
+// Se désabonner (retour au plan gratuit)
+app.post("/api/unsubscribe", authMiddleware, (req, res) => {
+  db.prepare("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = ?").run(req.userId);
+  res.json({ success: true });
+});
+
+// Tableau de bord créateur (réservé aux détenteurs du Pack Gold ou VIP)
+app.get("/api/me/creator-dashboard", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT plan, creator_balance FROM users WHERE id = ?").get(req.userId);
+  if (!isGoldOrAbove(user?.plan)) {
+    return res.status(403).json({ error: "Le Pack Gold est nécessaire pour accéder au tableau de bord créateur." });
+  }
+  const privatePosts = db.prepare("SELECT * FROM posts WHERE user_id = ? AND is_private = 1 ORDER BY created_at DESC").all(req.userId);
+  const postsWithStats = privatePosts.map((p) => {
+    const gifts = db
+      .prepare(
+        `SELECT COUNT(*) as count, COALESCE(SUM(g.price_coins), 0) as totalSpent
+         FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id WHERE gs.post_id = ?`
+      )
+      .get(p.id);
+    const viewCount = db.prepare("SELECT COUNT(*) c FROM post_views WHERE post_id = ?").get(p.id).c;
+    return { id: p.id, media_url: p.media_url, media_type: p.media_type, created_at: p.created_at, giftCount: gifts.count, viewCount };
+  });
+  const totalGiftsReceived = db
+    .prepare(
+      `SELECT COUNT(*) c FROM gifts_sent gs JOIN posts p ON p.id = gs.post_id WHERE gs.recipient_id = ? AND p.is_private = 1`
+    )
+    .get(req.userId).c;
+  const withdrawals = db
+    .prepare("SELECT id, amount_coins, status, created_at, processed_at FROM withdrawal_requests WHERE user_id = ? ORDER BY created_at DESC")
+    .all(req.userId);
+  res.json({
+    balance: user?.creator_balance || 0,
+    totalGiftsReceived,
+    posts: postsWithStats,
+    withdrawals,
+  });
+});
+
+// Demander un retrait des gains créateur
+app.post("/api/me/withdraw", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT plan, creator_balance FROM users WHERE id = ?").get(req.userId);
+  if (!isGoldOrAbove(user?.plan)) {
+    return res.status(403).json({ error: "Le Pack Gold est nécessaire pour demander un retrait." });
+  }
+  const amount = Math.floor(req.body?.amount);
+  if (!amount || amount <= 0) return res.status(400).json({ error: "Montant invalide." });
+  if (amount > (user.creator_balance || 0)) {
+    return res.status(402).json({ error: "Solde insuffisant pour ce retrait." });
+  }
+  db.prepare("UPDATE users SET creator_balance = creator_balance - ? WHERE id = ?").run(amount, req.userId);
+  const info = db
+    .prepare("INSERT INTO withdrawal_requests (user_id, amount_coins, status) VALUES (?, ?, 'pending')")
+    .run(req.userId, amount);
+  res.json({ success: true, withdrawalId: info.lastInsertRowid, remainingBalance: user.creator_balance - amount });
+});
+
+// --- Administration des demandes de retrait ---
+app.get("/api/admin/withdrawals", adminMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT w.*, u.name as user_name, u.email as user_email
+       FROM withdrawal_requests w JOIN users u ON u.id = w.user_id
+       WHERE w.status = 'pending' ORDER BY w.created_at ASC`
+    )
+    .all();
+  res.json({ withdrawals: rows });
+});
+
+app.post("/api/admin/withdrawals/:id/process", adminMiddleware, (req, res) => {
+  const decision = req.body?.decision === "rejected" ? "rejected" : "paid";
+  const withdrawal = db.prepare("SELECT * FROM withdrawal_requests WHERE id = ?").get(req.params.id);
+  if (!withdrawal) return res.status(404).json({ error: "Demande introuvable." });
+  if (decision === "rejected") {
+    // Le montant est recrédité au solde créateur si la demande est refusée.
+    db.prepare("UPDATE users SET creator_balance = creator_balance + ? WHERE id = ?").run(withdrawal.amount_coins, withdrawal.user_id);
+  }
+  db.prepare("UPDATE withdrawal_requests SET status = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?").run(decision, withdrawal.id);
+  res.json({ success: true, decision });
 });
 
 app.post("/api/boost", authMiddleware, (req, res) => {
