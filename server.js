@@ -267,8 +267,19 @@ try {
 }
 try {
   db.exec(`ALTER TABLE users ADD COLUMN orientation TEXT`);
-  db.exec(`ALTER TABLE users ADD COLUMN plan_expires_at TEXT`);
   db.exec(`ALTER TABLE users ADD COLUMN creator_balance INTEGER DEFAULT 0`);
+} catch (e) {
+  // Déjà présentes, rien à faire.
+}
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN phone TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN wants_marriage TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN wants_children TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN education_level TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN has_pets TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN drinks_alcohol TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN smokes TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN does_sport TEXT`);
 } catch (e) {
   // Déjà présentes, rien à faire.
 }
@@ -510,6 +521,32 @@ function adminMiddleware(req, res, next) {
   next();
 }
 
+// Champs qui font progresser la complétion du profil, avec leur poids respectif (total = 100).
+const PROFILE_COMPLETION_FIELDS = [
+  { key: "bio", weight: 12, check: (u) => !!u.bio && u.bio.trim().length > 0 },
+  { key: "photos", weight: 15, check: (u) => safeParseArray(u.photos).length >= 2 },
+  { key: "intention", weight: 10, check: (u) => !!u.intention },
+  { key: "interests", weight: 10, check: (u) => safeParseArray(u.interests).length > 0 },
+  { key: "profession", weight: 8, check: (u) => !!u.profession },
+  { key: "city", weight: 8, check: (u) => !!u.city },
+  { key: "taille", weight: 5, check: (u) => !!u.taille },
+  { key: "wants_marriage", weight: 6, check: (u) => !!u.wants_marriage },
+  { key: "wants_children", weight: 6, check: (u) => !!u.wants_children },
+  { key: "education_level", weight: 5, check: (u) => !!u.education_level },
+  { key: "has_pets", weight: 4, check: (u) => !!u.has_pets },
+  { key: "drinks_alcohol", weight: 4, check: (u) => !!u.drinks_alcohol },
+  { key: "smokes", weight: 3, check: (u) => !!u.smokes },
+  { key: "does_sport", weight: 4, check: (u) => !!u.does_sport },
+];
+
+function computeProfileCompletion(u) {
+  let score = 0;
+  for (const f of PROFILE_COMPLETION_FIELDS) {
+    if (f.check(u)) score += f.weight;
+  }
+  return Math.min(100, Math.round(score));
+}
+
 function publicUser(u) {
   if (!u) return null;
   const { password_hash, ...rest } = u;
@@ -520,6 +557,7 @@ function publicUser(u) {
     langues: safeParseArray(u.langues),
     blocked_locations: safeParseArray(u.blocked_locations),
     private_photos: safeParseArray(u.private_photos),
+    profileCompletion: computeProfileCompletion(u),
   };
 }
 
@@ -553,12 +591,12 @@ async function sendPushToUser(userId, payload) {
 // ---------- Auth routes ----------
 app.post("/api/auth/register", authRateLimit, async (req, res) => {
   const {
-    name, email, password, intention,
+    name, email, phone, password, intention,
     birthdate, genre, genre_recherche, city, profession, taille,
     bio, photos, interests, langues, acceptedTerms, orientation,
   } = req.body || {};
-  if (!name || !email || !password) {
-    return res.status(400).json({ error: "Nom, email et mot de passe sont requis." });
+  if (!name || (!email && !phone) || !password) {
+    return res.status(400).json({ error: "Nom, (email ou téléphone) et mot de passe sont requis." });
   }
   if (!birthdate) {
     return res.status(400).json({ error: "La date de naissance est obligatoire." });
@@ -573,24 +611,32 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
   if (!acceptedTerms) {
     return res.status(400).json({ error: "Tu dois accepter les Conditions d'utilisation et la Politique de confidentialité pour créer un compte." });
   }
-  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-  if (existing) return res.status(409).json({ error: "Un compte existe déjà avec cet email." });
+  if (email) {
+    const existingEmail = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    if (existingEmail) return res.status(409).json({ error: "Un compte existe déjà avec cet email." });
+  }
+  if (phone) {
+    const existingPhone = db.prepare("SELECT id FROM users WHERE phone = ?").get(phone);
+    if (existingPhone) return res.status(409).json({ error: "Un compte existe déjà avec ce numéro de téléphone." });
+  }
 
   const hash = await bcrypt.hash(password, 10);
   const photosArr = Array.isArray(photos) ? photos : [];
+  // Sans email, on génère un email interne unique (jamais affiché) : la colonne email reste NOT NULL UNIQUE.
+  const effectiveEmail = email || `phone_${(phone || "").replace(/[^0-9]/g, "")}_${Date.now()}@lovinia.local`;
   // NOTE : la vérification par email est désactivée pour le moment (mise en pause, pas supprimée).
   // Les nouveaux comptes sont donc marqués comme "vérifiés" par défaut (email_verified = 1) pour
   // ne bloquer aucune fonctionnalité. Le token reste généré et stocké, prêt à être réactivé plus tard.
   const emailVerifyToken = crypto.randomBytes(24).toString("hex");
   const info = db
     .prepare(
-      `INSERT INTO users (name, email, password_hash, intention, birthdate, age, genre, genre_recherche,
+      `INSERT INTO users (name, email, phone, password_hash, intention, birthdate, age, genre, genre_recherche,
         city, profession, taille, bio, img, photos, interests, langues, orientation,
         terms_accepted_at, email_verify_token, email_verified)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)`
     )
     .run(
-      name, email, hash, intention || "", birthdate, age,
+      name, effectiveEmail, phone || null, hash, intention || "", birthdate, age,
       genre || "Non précisé", genre_recherche || "Tous", city || "",
       profession || "", taille || null, bio || "", photosArr[0] || "",
       JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || []),
@@ -603,11 +649,15 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
 });
 
 app.post("/api/auth/login", authRateLimit, async (req, res) => {
-  const { email, password } = req.body || {};
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  if (!user) return res.status(401).json({ error: "Email ou mot de passe incorrect." });
+  const { email, phone, password } = req.body || {};
+  const identifier = email || phone;
+  if (!identifier || !password) return res.status(400).json({ error: "Identifiant et mot de passe requis." });
+  const user = phone && !email
+    ? db.prepare("SELECT * FROM users WHERE phone = ?").get(identifier)
+    : db.prepare("SELECT * FROM users WHERE email = ? OR phone = ?").get(identifier, identifier);
+  if (!user) return res.status(401).json({ error: "Identifiant ou mot de passe incorrect." });
   const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: "Email ou mot de passe incorrect." });
+  if (!ok) return res.status(401).json({ error: "Identifiant ou mot de passe incorrect." });
   if (user.suspended) return res.status(403).json({ error: "Ce compte a été suspendu." });
   res.json({ token: signToken(user), user: publicUser(user) });
 });
@@ -689,6 +739,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     hideExactDistance, blockedLocations, privatePhotos,
     travelActive, travelCity, travelLat, travelLng, acceptedTerms,
     acceptGifts, giftSendersRestriction, hideGiftCount,
+    phone, wantsMarriage, wantsChildren, educationLevel, hasPets, drinksAlcohol, smokes, doesSport,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
   if (birthdate && (age === null || age < 18)) {
@@ -696,6 +747,10 @@ app.put("/api/me", authMiddleware, (req, res) => {
   }
   if (acceptedTerms) {
     db.prepare("UPDATE users SET terms_accepted_at = CURRENT_TIMESTAMP WHERE id = ?").run(req.userId);
+  }
+  if (phone) {
+    const existingPhone = db.prepare("SELECT id FROM users WHERE phone = ? AND id != ?").get(phone, req.userId);
+    if (existingPhone) return res.status(409).json({ error: "Ce numéro de téléphone est déjà utilisé par un autre compte." });
   }
   const primaryImg = photos && photos.length ? photos[0] : img;
   db.prepare(
@@ -716,7 +771,15 @@ app.put("/api/me", authMiddleware, (req, res) => {
      travel_lng = COALESCE(?, travel_lng),
      accept_gifts = COALESCE(?, accept_gifts),
      gift_senders_restriction = COALESCE(?, gift_senders_restriction),
-     hide_gift_count = COALESCE(?, hide_gift_count)
+     hide_gift_count = COALESCE(?, hide_gift_count),
+     phone = COALESCE(?, phone),
+     wants_marriage = COALESCE(?, wants_marriage),
+     wants_children = COALESCE(?, wants_children),
+     education_level = COALESCE(?, education_level),
+     has_pets = COALESCE(?, has_pets),
+     drinks_alcohol = COALESCE(?, drinks_alcohol),
+     smokes = COALESCE(?, smokes),
+     does_sport = COALESCE(?, does_sport)
      WHERE id = ?`
   ).run(
     name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
@@ -733,6 +796,8 @@ app.put("/api/me", authMiddleware, (req, res) => {
     acceptGifts === undefined ? null : (acceptGifts ? 1 : 0),
     giftSendersRestriction ?? null,
     hideGiftCount === undefined ? null : (hideGiftCount ? 1 : 0),
+    phone || null, wantsMarriage || null, wantsChildren || null, educationLevel || null,
+    hasPets || null, drinksAlcohol || null, smokes || null, doesSport || null,
     req.userId
   );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
@@ -759,7 +824,8 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const placeholders = exclude.map(() => "?").join(",");
 
   let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
-      verification_status, latitude, longitude, boosted_until, hide_exact_distance FROM users
+      verification_status, latitude, longitude, boosted_until, hide_exact_distance,
+      wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0)`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
@@ -924,7 +990,11 @@ app.post("/api/swipe/undo", authMiddleware, (req, res) => {
   db.prepare("DELETE FROM swipes WHERE id = ?").run(last.id);
 
   const profile = db
-    .prepare("SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status FROM users WHERE id = ?")
+    .prepare(
+      `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status,
+         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport
+       FROM users WHERE id = ?`
+    )
     .get(last.to_user_id);
   if (profile) profile.photos = safeParseArray(profile.photos), profile.interests = safeParseArray(profile.interests), profile.langues = safeParseArray(profile.langues);
 
@@ -960,16 +1030,55 @@ app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
   const p = db
     .prepare(
       `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
-         verification_status, last_active_at FROM users WHERE id = ?`
+         verification_status, last_active_at,
+         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport
+       FROM users WHERE id = ?`
     )
     .get(otherId);
   if (!p) return res.status(404).json({ error: "Profil introuvable." });
+
+  const me = db
+    .prepare(
+      `SELECT age, intention, interests, langues, wants_marriage, wants_children FROM users WHERE id = ?`
+    )
+    .get(req.userId);
+
+  const otherInterests = safeParseArray(p.interests);
+  const otherLangues = safeParseArray(p.langues);
+  const myInterests = safeParseArray(me?.interests);
+  const myLangues = safeParseArray(me?.langues);
+
+  const sharedInterests = otherInterests.filter((i) => myInterests.includes(i));
+  const sharedLangues = otherLangues.filter((l) => myLangues.includes(l));
+  const sameIntention = !!me?.intention && me.intention === p.intention;
+  const ageDiff = me?.age != null && p.age != null ? Math.abs(me.age - p.age) : null;
+  const sameMarriageGoal = !!me?.wants_marriage && me.wants_marriage === p.wants_marriage;
+  const sameChildrenGoal = !!me?.wants_children && me.wants_children === p.wants_children;
+
+  let score = 50;
+  score += Math.min(sharedInterests.length * 4, 20);
+  score += sameIntention ? 15 : 0;
+  score += sharedLangues.length > 0 ? 8 : 0;
+  score += ageDiff !== null ? (ageDiff <= 3 ? 10 : ageDiff <= 7 ? 5 : 0) : 0;
+  score += sameMarriageGoal ? 4 : 0;
+  score += sameChildrenGoal ? 3 : 0;
+  score = Math.min(score, 98);
+
   res.json({
     profile: {
       ...p,
       photos: safeParseArray(p.photos),
-      interests: safeParseArray(p.interests),
-      langues: safeParseArray(p.langues),
+      interests: otherInterests,
+      langues: otherLangues,
+    },
+    compatibility: {
+      score,
+      sharedInterests,
+      sharedLangues,
+      sameIntention,
+      sameAgeRange: ageDiff !== null && ageDiff <= 5,
+      sameMarriageGoal,
+      sameChildrenGoal,
     },
   });
 });
