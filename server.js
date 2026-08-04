@@ -280,6 +280,8 @@ try {
   db.exec(`ALTER TABLE users ADD COLUMN drinks_alcohol TEXT`);
   db.exec(`ALTER TABLE users ADD COLUMN smokes TEXT`);
   db.exec(`ALTER TABLE users ADD COLUMN does_sport TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN religion TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN astro_sign TEXT`);
 } catch (e) {
   // Déjà présentes, rien à faire.
 }
@@ -740,6 +742,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     travelActive, travelCity, travelLat, travelLng, acceptedTerms,
     acceptGifts, giftSendersRestriction, hideGiftCount,
     phone, wantsMarriage, wantsChildren, educationLevel, hasPets, drinksAlcohol, smokes, doesSport,
+    religion, astroSign,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
   if (birthdate && (age === null || age < 18)) {
@@ -779,7 +782,9 @@ app.put("/api/me", authMiddleware, (req, res) => {
      has_pets = COALESCE(?, has_pets),
      drinks_alcohol = COALESCE(?, drinks_alcohol),
      smokes = COALESCE(?, smokes),
-     does_sport = COALESCE(?, does_sport)
+     does_sport = COALESCE(?, does_sport),
+     religion = COALESCE(?, religion),
+     astro_sign = COALESCE(?, astro_sign)
      WHERE id = ?`
   ).run(
     name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
@@ -798,6 +803,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     hideGiftCount === undefined ? null : (hideGiftCount ? 1 : 0),
     phone || null, wantsMarriage || null, wantsChildren || null, educationLevel || null,
     hasPets || null, drinksAlcohol || null, smokes || null, doesSport || null,
+    religion || null, astroSign || null,
     req.userId
   );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
@@ -825,7 +831,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
 
   let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
       verification_status, latitude, longitude, boosted_until, hide_exact_distance,
-      wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport FROM users
+      wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0)`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
@@ -992,7 +998,7 @@ app.post("/api/swipe/undo", authMiddleware, (req, res) => {
   const profile = db
     .prepare(
       `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status,
-         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport
+         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign
        FROM users WHERE id = ?`
     )
     .get(last.to_user_id);
@@ -1031,7 +1037,7 @@ app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
     .prepare(
       `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
          verification_status, last_active_at,
-         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport
+         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign
        FROM users WHERE id = ?`
     )
     .get(otherId);
