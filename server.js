@@ -445,7 +445,26 @@ function distanceKm(lat1, lon1, lat2, lon2) {
 }
 
 const app = express();
-app.use(cors());
+
+// ---------- CORS restreint ----------
+// Seuls les domaines officiels de Lovinia peuvent appeler cette API — empêche n'importe quel
+// autre site de faire des requêtes vers ton backend depuis le navigateur d'un utilisateur.
+const ALLOWED_ORIGINS = [
+  "https://lovinia.fr",
+  "https://www.lovinia.fr",
+  "https://lovinia-frontend.vercel.app", // domaine de secours Vercel
+];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Pas d'origine (app native/TWA, curl, requêtes serveur à serveur) : autorisé.
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Origine non autorisée par CORS."));
+    }
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 // ---------- Anti-abus (rate limiting) ----------
