@@ -290,6 +290,13 @@ try {
   // Déjà présentes, rien à faire.
 }
 try {
+  db.exec(`ALTER TABLE users ADD COLUMN primary_photo_status TEXT DEFAULT 'approved'`);
+  // Les comptes déjà existants avant cette mise à jour gardent leur photo actuelle affichée (pas de blocage rétroactif).
+  db.exec(`UPDATE users SET primary_photo_status = 'approved' WHERE primary_photo_status IS NULL`);
+} catch (e) {
+  // Déjà présente, rien à faire.
+}
+try {
   db.exec(`ALTER TABLE posts ADD COLUMN is_private INTEGER DEFAULT 0`);
 } catch (e) {
   // Déjà présente, rien à faire.
@@ -657,8 +664,8 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     .prepare(
       `INSERT INTO users (name, email, phone, password_hash, intention, birthdate, age, genre, genre_recherche,
         city, profession, taille, bio, img, photos, interests, langues, orientation,
-        terms_accepted_at, email_verify_token, email_verified)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)`
+        terms_accepted_at, email_verify_token, email_verified, primary_photo_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1, ?)`
     )
     .run(
       name, effectiveEmail, phone || null, hash, intention || "", birthdate, age,
@@ -666,7 +673,8 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
       profession || "", taille || null, bio || "", photosArr[0] || "",
       JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || []),
       orientation || "",
-      emailVerifyToken
+      emailVerifyToken,
+      photosArr[0] ? "pending" : "approved" // pas de photo à modérer si aucune n'a encore été ajoutée
     );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   // sendVerificationEmail(user.email, user.name, emailVerifyToken).catch(() => {}); // désactivé pour le moment
@@ -779,6 +787,14 @@ app.put("/api/me", authMiddleware, (req, res) => {
     if (existingPhone) return res.status(409).json({ error: "Ce numéro de téléphone est déjà utilisé par un autre compte." });
   }
   const primaryImg = photos && photos.length ? photos[0] : img;
+  let nextPhotoStatus = null; // null = ne touche pas à la colonne (COALESCE)
+  if (primaryImg) {
+    const current = db.prepare("SELECT img FROM users WHERE id = ?").get(req.userId);
+    if (current && current.img !== primaryImg) {
+      // La photo affichée change : elle reste visible tout de suite, mais repart en file de modération.
+      nextPhotoStatus = "pending";
+    }
+  }
   db.prepare(
     `UPDATE users SET name = COALESCE(?, name), genre = COALESCE(?, genre),
      genre_recherche = COALESCE(?, genre_recherche), city = COALESCE(?, city),
@@ -788,6 +804,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
      interests = COALESCE(?, interests), langues = COALESCE(?, langues),
      latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude),
      invisible = COALESCE(?, invisible),
+     primary_photo_status = COALESCE(?, primary_photo_status),
      hide_exact_distance = COALESCE(?, hide_exact_distance),
      blocked_locations = COALESCE(?, blocked_locations),
      private_photos = COALESCE(?, private_photos),
@@ -816,6 +833,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     langues ? JSON.stringify(langues) : null,
     latitude ?? null, longitude ?? null,
     invisible === undefined ? null : (invisible ? 1 : 0),
+    nextPhotoStatus,
     hideExactDistance === undefined ? null : (hideExactDistance ? 1 : 0),
     blockedLocations ? JSON.stringify(blockedLocations) : null,
     privatePhotos ? JSON.stringify(privatePhotos) : null,
@@ -855,7 +873,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
       verification_status, latitude, longitude, boosted_until, hide_exact_distance,
       wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign FROM users
-    WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0)`;
+    WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0) AND primary_photo_status != 'rejected'`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
   if (genre !== "Tous") {
@@ -951,8 +969,15 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     return res.status(400).json({ error: "Paramètres invalides." });
   }
 
-  const user = db.prepare("SELECT genre, plan, coins, email_verified FROM users WHERE id = ?").get(req.userId);
+  const user = db.prepare("SELECT genre, plan, coins, email_verified, primary_photo_status FROM users WHERE id = ?").get(req.userId);
   const isPremium = user?.plan && user.plan !== "free";
+
+  if ((action === "like" || action === "superlike") && user?.primary_photo_status === "rejected") {
+    return res.status(403).json({
+      error: "Ta photo de profil a été refusée par la modération. Change-la dans ton profil pour pouvoir liker à nouveau.",
+      code: "PHOTO_REJECTED",
+    });
+  }
 
   if ((action === "like" || action === "superlike") && !isPremium) {
     const limit = dailyLikeLimit(user?.genre);
@@ -1417,6 +1442,22 @@ app.post("/api/admin/posts/:postId/moderate", adminMiddleware, (req, res) => {
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
   if (!post) return res.status(404).json({ error: "Publication introuvable." });
   db.prepare("UPDATE posts SET moderation_status = ? WHERE id = ?").run(decision, post.id);
+  res.json({ success: true, decision });
+});
+
+// --- Modération des photos de profil principales ---
+app.get("/api/admin/profile-photos/pending", adminMiddleware, (req, res) => {
+  const rows = db
+    .prepare(`SELECT id, name, email, img FROM users WHERE primary_photo_status = 'pending' ORDER BY id ASC`)
+    .all();
+  res.json({ users: rows });
+});
+
+app.post("/api/admin/profile-photos/:userId/moderate", adminMiddleware, (req, res) => {
+  const decision = req.body?.decision === "rejected" ? "rejected" : "approved";
+  const target = db.prepare("SELECT id FROM users WHERE id = ?").get(req.params.userId);
+  if (!target) return res.status(404).json({ error: "Compte introuvable." });
+  db.prepare("UPDATE users SET primary_photo_status = ? WHERE id = ?").run(decision, target.id);
   res.json({ success: true, decision });
 });
 
