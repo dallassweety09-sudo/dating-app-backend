@@ -1904,6 +1904,20 @@ app.delete("/api/me", authMiddleware, async (req, res) => {
   res.json({ deleted: true });
 });
 
+// ---------- Filet de sécurité global ----------
+// Si une route plante pour une raison imprévue, Express renvoie par défaut une page HTML
+// d'erreur — ce qui casse le frontend (qui attend du JSON) avec un message confus du genre
+// "Unexpected token '<'" ou "The string did not match the expected pattern" côté navigateur.
+// Ce gestionnaire s'assure qu'on renvoie TOUJOURS du JSON, même en cas d'erreur inattendue.
+app.use((req, res) => {
+  res.status(404).json({ error: "Route introuvable." });
+});
+app.use((err, req, res, next) => {
+  console.error("Erreur non gérée :", err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: "Une erreur inattendue est survenue sur le serveur. Réessaie dans un instant." });
+});
+
 app.listen(PORT, () => {
   console.log(`API de l'appli de rencontre lancée sur http://localhost:${PORT}`);
   // Diagnostic temporaire complet : vérifie TOUTES les variables attendues, pour savoir si le
