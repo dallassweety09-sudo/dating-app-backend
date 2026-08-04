@@ -280,6 +280,10 @@ try {
   db.exec(`ALTER TABLE users ADD COLUMN drinks_alcohol TEXT`);
   db.exec(`ALTER TABLE users ADD COLUMN smokes TEXT`);
   db.exec(`ALTER TABLE users ADD COLUMN does_sport TEXT`);
+} catch (e) {
+  // Déjà présentes, rien à faire.
+}
+try {
   db.exec(`ALTER TABLE users ADD COLUMN religion TEXT`);
   db.exec(`ALTER TABLE users ADD COLUMN astro_sign TEXT`);
 } catch (e) {
