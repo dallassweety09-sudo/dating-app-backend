@@ -864,7 +864,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const {
     genre = "Tous", ageMin = 18, ageMax = 99, intention = "",
     verifiedOnly = "false", langue = "", tailleMin = "", tailleMax = "", commonInterests = "false",
-    maxDistance = "",
+    maxDistance = "", ville = "",
   } = req.query;
 
   const alreadySwiped = db
@@ -902,6 +902,11 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   if (tailleMax) {
     query += " AND taille <= ?";
     params.push(Number(tailleMax));
+  }
+  if (ville && ville.trim()) {
+    // Insensible à la casse et aux accents approximatifs : "douala" retrouve "Douala".
+    query += " AND LOWER(city) LIKE ?";
+    params.push(`%${ville.trim().toLowerCase()}%`);
   }
 
   const me = db.prepare("SELECT latitude, longitude, interests, travel_active, travel_lat, travel_lng, blocked_locations FROM users WHERE id = ?").get(req.userId);
