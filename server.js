@@ -637,6 +637,19 @@ function safeParseArray(str) {
   }
 }
 
+// La galerie mélange désormais photos et courtes vidéos, dans l'ordre choisi par l'utilisateur
+// (items sous forme { url, type } ; l'ancien format — un simple tableau d'URLs — reste supporté
+// pour les comptes créés avant ce changement, chaque URL étant alors traitée comme une photo).
+// La photo de profil affichée partout ailleurs (listes de matchs, conversations, avatars...) doit
+// toujours être une PHOTO, jamais une vidéo : cette fonction retrouve la première du tableau,
+// quelle que soit sa position dans la galerie.
+function firstPhotoUrl(mediaArr) {
+  if (!Array.isArray(mediaArr)) return "";
+  const item = mediaArr.find((m) => (typeof m === "string" && m) || (m && typeof m === "object" && m.type !== "video" && m.url));
+  if (!item) return "";
+  return typeof item === "string" ? item : item.url || "";
+}
+
 async function sendPushToUser(userId, payload) {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return; // Notifications push non configurées.
   const subs = db.prepare("SELECT * FROM push_subscriptions WHERE user_id = ?").all(userId);
@@ -705,11 +718,11 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     .run(
       name, effectiveEmail, phone || null, hash, intention || "", birthdate, age,
       genre || "Non précisé", genre_recherche || "Tous", country || "", city || "",
-      profession || "", taille || null, bio || "", photosArr[0] || "",
+      profession || "", taille || null, bio || "", firstPhotoUrl(photosArr),
       JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || []),
       orientation || "",
       emailVerifyToken,
-      photosArr[0] ? "pending" : "approved" // pas de photo à modérer si aucune n'a encore été ajoutée
+      firstPhotoUrl(photosArr) ? "pending" : "approved" // pas de photo à modérer si aucune n'a encore été ajoutée
     );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   // sendVerificationEmail(user.email, user.name, emailVerifyToken).catch(() => {}); // désactivé pour le moment
@@ -837,7 +850,9 @@ app.put("/api/me", authMiddleware, (req, res) => {
     const existingPhone = db.prepare("SELECT id FROM users WHERE phone = ? AND id != ?").get(phone, req.userId);
     if (existingPhone) return res.status(409).json({ error: "Ce numéro de téléphone est déjà utilisé par un autre compte." });
   }
-  const primaryImg = photos && photos.length ? photos[0] : img;
+  // Si la galerie envoyée ne contient aucune photo (que des vidéos), on garde l'ancien avatar
+  // plutôt que d'écraser "img" avec une chaîne vide.
+  const primaryImg = photos && photos.length ? (firstPhotoUrl(photos) || img) : img;
   let nextPhotoStatus = null; // null = ne touche pas à la colonne (COALESCE)
   if (primaryImg) {
     const current = db.prepare("SELECT img FROM users WHERE id = ?").get(req.userId);
