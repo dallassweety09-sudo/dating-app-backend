@@ -194,7 +194,24 @@ CREATE TABLE IF NOT EXISTS withdrawal_requests (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   processed_at TEXT
 );
+
+-- Jetons explicitement révoqués via "Se déconnecter". Les JWT restent valides jusqu'à leur
+-- expiration naturelle (30 jours) ; on les liste ici pour fermer la session immédiatement côté
+-- serveur dès la déconnexion, plutôt que de compter uniquement sur la suppression du token côté client.
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  revoked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT
+);
 `);
+
+// Nettoyage des jetons révoqués déjà expirés naturellement, pour ne pas faire grossir la table indéfiniment.
+try {
+  db.prepare("DELETE FROM revoked_tokens WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").run();
+} catch (e) {
+  // Table pas encore présente sur une très vieille base : rien à nettoyer.
+}
 
 // Cadeaux par défaut, créés une seule fois si la boutique est vide.
 if (db.prepare("SELECT COUNT(*) c FROM gift_catalog").get().c === 0) {
@@ -539,10 +556,15 @@ function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: "Non authentifié." });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    // Un jeton explicitement révoqué via "Se déconnecter" ne doit plus donner accès,
+    // même s'il n'a pas encore atteint sa date d'expiration naturelle.
+    const revoked = db.prepare("SELECT 1 FROM revoked_tokens WHERE token = ?").get(token);
+    if (revoked) return res.status(401).json({ error: "Session fermée, reconnecte-toi." });
     const user = db.prepare("SELECT suspended FROM users WHERE id = ?").get(payload.id);
     if (!user) return res.status(401).json({ error: "Compte introuvable." });
     if (user.suspended) return res.status(403).json({ error: "Ce compte a été suspendu." });
     req.userId = payload.id;
+    req.authToken = token;
     // Marque l'utilisateur comme actif à l'instant (sert au statut "En ligne" / "Vu il y a...").
     db.prepare("UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE id = ?").run(payload.id);
     next();
@@ -699,6 +721,22 @@ app.post("/api/auth/login", authRateLimit, async (req, res) => {
   if (!ok) return res.status(401).json({ error: "Identifiant ou mot de passe incorrect." });
   if (user.suspended) return res.status(403).json({ error: "Ce compte a été suspendu." });
   res.json({ token: signToken(user), user: publicUser(user) });
+});
+
+// Déconnexion : révoque explicitement le jeton côté serveur, pour que la session soit
+// réellement fermée (et pas seulement effacée sur l'appareil). Nécessite d'être joignable
+// et authentifié : si l'appareil n'a pas de connexion, la requête échoue côté client et
+// celui-ci ne doit alors PAS effacer sa session locale (voir le frontend).
+app.post("/api/auth/logout", authMiddleware, (req, res) => {
+  try {
+    const decoded = jwt.decode(req.authToken);
+    const expiresAt = decoded?.exp ? new Date(decoded.exp * 1000).toISOString() : null;
+    db.prepare("INSERT OR REPLACE INTO revoked_tokens (token, user_id, expires_at) VALUES (?, ?, ?)")
+      .run(req.authToken, req.userId, expiresAt);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: "Impossible de fermer la session côté serveur. Réessaie." });
+  }
 });
 
 app.post("/api/auth/google", async (req, res) => {
