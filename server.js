@@ -290,6 +290,12 @@ try {
   // Déjà présentes, rien à faire.
 }
 try {
+  db.exec(`ALTER TABLE users ADD COLUMN love_language TEXT`);
+  db.exec(`ALTER TABLE users ADD COLUMN communication_style TEXT`);
+} catch (e) {
+  // Déjà présentes, rien à faire.
+}
+try {
   db.exec(`ALTER TABLE users ADD COLUMN primary_photo_status TEXT DEFAULT 'approved'`);
   // Les comptes déjà existants avant cette mise à jour gardent leur photo actuelle affichée (pas de blocage rétroactif).
   db.exec(`UPDATE users SET primary_photo_status = 'approved' WHERE primary_photo_status IS NULL`);
@@ -773,7 +779,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     travelActive, travelCity, travelLat, travelLng, acceptedTerms,
     acceptGifts, giftSendersRestriction, hideGiftCount,
     phone, wantsMarriage, wantsChildren, educationLevel, hasPets, drinksAlcohol, smokes, doesSport,
-    religion, astroSign,
+    religion, astroSign, loveLanguage, communicationStyle,
   } = req.body || {};
   const age = birthdate ? calculateAge(birthdate) : null;
   if (birthdate && (age === null || age < 18)) {
@@ -824,7 +830,9 @@ app.put("/api/me", authMiddleware, (req, res) => {
      smokes = COALESCE(?, smokes),
      does_sport = COALESCE(?, does_sport),
      religion = COALESCE(?, religion),
-     astro_sign = COALESCE(?, astro_sign)
+     astro_sign = COALESCE(?, astro_sign),
+     love_language = COALESCE(?, love_language),
+     communication_style = COALESCE(?, communication_style)
      WHERE id = ?`
   ).run(
     name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
@@ -844,7 +852,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
     hideGiftCount === undefined ? null : (hideGiftCount ? 1 : 0),
     phone || null, wantsMarriage || null, wantsChildren || null, educationLevel || null,
     hasPets || null, drinksAlcohol || null, smokes || null, doesSport || null,
-    religion || null, astroSign || null,
+    religion || null, astroSign || null, loveLanguage || null, communicationStyle || null,
     req.userId
   );
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
@@ -872,7 +880,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
 
   let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
       verification_status, latitude, longitude, boosted_until, hide_exact_distance,
-      wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign FROM users
+      wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign, love_language, communication_style FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0) AND primary_photo_status != 'rejected'`;
   const params = [...exclude, Number(ageMin), Number(ageMax)];
 
@@ -1046,7 +1054,7 @@ app.post("/api/swipe/undo", authMiddleware, (req, res) => {
   const profile = db
     .prepare(
       `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status,
-         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign
+         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign, love_language, communication_style
        FROM users WHERE id = ?`
     )
     .get(last.to_user_id);
@@ -1085,7 +1093,7 @@ app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
     .prepare(
       `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
          verification_status, last_active_at,
-         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign
+         wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign, love_language, communication_style
        FROM users WHERE id = ?`
     )
     .get(otherId);
