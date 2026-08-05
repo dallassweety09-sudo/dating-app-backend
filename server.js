@@ -313,6 +313,13 @@ try {
   // Déjà présentes, rien à faire.
 }
 try {
+  // Le pays est saisi à l'inscription (sélection guidée), et sert à filtrer la liste de villes
+  // proposée ainsi qu'à affiner les recherches/filtres par la suite.
+  db.exec(`ALTER TABLE users ADD COLUMN country TEXT`);
+} catch (e) {
+  // Déjà présente, rien à faire.
+}
+try {
   db.exec(`ALTER TABLE users ADD COLUMN primary_photo_status TEXT DEFAULT 'approved'`);
   // Les comptes déjà existants avant cette mise à jour gardent leur photo actuelle affichée (pas de blocage rétroactif).
   db.exec(`UPDATE users SET primary_photo_status = 'approved' WHERE primary_photo_status IS NULL`);
@@ -652,7 +659,7 @@ async function sendPushToUser(userId, payload) {
 app.post("/api/auth/register", authRateLimit, async (req, res) => {
   const {
     name, email, phone, password, intention,
-    birthdate, genre, genre_recherche, city, profession, taille,
+    birthdate, genre, genre_recherche, country, city, profession, taille,
     bio, photos, interests, langues, acceptedTerms, orientation,
   } = req.body || {};
   if (!name || (!email && !phone) || !password) {
@@ -691,13 +698,13 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
   const info = db
     .prepare(
       `INSERT INTO users (name, email, phone, password_hash, intention, birthdate, age, genre, genre_recherche,
-        city, profession, taille, bio, img, photos, interests, langues, orientation,
+        country, city, profession, taille, bio, img, photos, interests, langues, orientation,
         terms_accepted_at, email_verify_token, email_verified, primary_photo_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1, ?)`
     )
     .run(
       name, effectiveEmail, phone || null, hash, intention || "", birthdate, age,
-      genre || "Non précisé", genre_recherche || "Tous", city || "",
+      genre || "Non précisé", genre_recherche || "Tous", country || "", city || "",
       profession || "", taille || null, bio || "", photosArr[0] || "",
       JSON.stringify(photosArr), JSON.stringify(interests || []), JSON.stringify(langues || []),
       orientation || "",
@@ -810,7 +817,7 @@ app.get("/api/me", authMiddleware, (req, res) => {
 
 app.put("/api/me", authMiddleware, (req, res) => {
   const {
-    name, genre, genre_recherche, city, bio, img, intention,
+    name, genre, genre_recherche, country, city, bio, img, intention,
     birthdate, profession, taille, photos, interests, langues,
     latitude, longitude, invisible,
     hideExactDistance, blockedLocations, privatePhotos,
@@ -841,7 +848,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
   }
   db.prepare(
     `UPDATE users SET name = COALESCE(?, name), genre = COALESCE(?, genre),
-     genre_recherche = COALESCE(?, genre_recherche), city = COALESCE(?, city),
+     genre_recherche = COALESCE(?, genre_recherche), country = COALESCE(?, country), city = COALESCE(?, city),
      bio = COALESCE(?, bio), img = COALESCE(?, img), intention = COALESCE(?, intention),
      birthdate = COALESCE(?, birthdate), age = COALESCE(?, age), profession = COALESCE(?, profession),
      taille = COALESCE(?, taille), photos = COALESCE(?, photos),
@@ -873,7 +880,7 @@ app.put("/api/me", authMiddleware, (req, res) => {
      communication_style = COALESCE(?, communication_style)
      WHERE id = ?`
   ).run(
-    name, genre, genre_recherche, city, bio, primaryImg, intention, birthdate, age, profession, taille,
+    name, genre, genre_recherche, country, city, bio, primaryImg, intention, birthdate, age, profession, taille,
     photos ? JSON.stringify(photos) : null,
     interests ? JSON.stringify(interests) : null,
     langues ? JSON.stringify(langues) : null,
@@ -902,7 +909,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const {
     genre = "Tous", ageMin = 18, ageMax = 99, intention = "",
     verifiedOnly = "false", langue = "", tailleMin = "", tailleMax = "", commonInterests = "false",
-    maxDistance = "", ville = "",
+    maxDistance = "", ville = "", pays = "",
   } = req.query;
 
   const alreadySwiped = db
@@ -916,7 +923,7 @@ app.get("/api/discover", authMiddleware, (req, res) => {
   const exclude = [req.userId, ...alreadySwiped, ...blockedByMe, ...blockedMe];
   const placeholders = exclude.map(() => "?").join(",");
 
-  let query = `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
+  let query = `SELECT id, name, age, genre, country, city, bio, img, intention, profession, taille, photos, interests, langues,
       verification_status, latitude, longitude, boosted_until, hide_exact_distance,
       wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign, love_language, communication_style FROM users
     WHERE id NOT IN (${placeholders}) AND age >= ? AND age <= ? AND (invisible IS NULL OR invisible = 0) AND (suspended IS NULL OR suspended = 0) AND primary_photo_status != 'rejected'`;
@@ -945,6 +952,12 @@ app.get("/api/discover", authMiddleware, (req, res) => {
     // Insensible à la casse et aux accents approximatifs : "douala" retrouve "Douala".
     query += " AND LOWER(city) LIKE ?";
     params.push(`%${ville.trim().toLowerCase()}%`);
+  }
+  if (pays && pays.trim()) {
+    // Correspondance exacte (insensible à la casse) : les villes venant de la liste guidée
+    // à l'inscription sont uniformisées, donc un match exact sur le pays est fiable ici.
+    query += " AND LOWER(country) = ?";
+    params.push(pays.trim().toLowerCase());
   }
 
   const me = db.prepare("SELECT latitude, longitude, interests, travel_active, travel_lat, travel_lng, blocked_locations FROM users WHERE id = ?").get(req.userId);
@@ -1096,7 +1109,7 @@ app.post("/api/swipe/undo", authMiddleware, (req, res) => {
 
   const profile = db
     .prepare(
-      `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status,
+      `SELECT id, name, age, genre, country, city, bio, img, intention, profession, taille, photos, interests, langues, verification_status,
          wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign, love_language, communication_style
        FROM users WHERE id = ?`
     )
@@ -1134,7 +1147,7 @@ app.get("/api/matches/:matchId/profile", authMiddleware, (req, res) => {
   const otherId = match.user_a_id === req.userId ? match.user_b_id : match.user_a_id;
   const p = db
     .prepare(
-      `SELECT id, name, age, genre, city, bio, img, intention, profession, taille, photos, interests, langues,
+      `SELECT id, name, age, genre, country, city, bio, img, intention, profession, taille, photos, interests, langues,
          verification_status, last_active_at,
          wants_marriage, wants_children, education_level, has_pets, drinks_alcohol, smokes, does_sport, religion, astro_sign, love_language, communication_style
        FROM users WHERE id = ?`
