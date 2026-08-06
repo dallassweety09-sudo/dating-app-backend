@@ -16,6 +16,23 @@ const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:contact@lovinia.fr";
 
+// ---------- Paiement réel (Mobile Money via CinetPay) ----------
+// CINETPAY_API_KEY / CINETPAY_SITE_ID : fournis par le tableau de bord marchand CinetPay
+// (https://app.cinetpay.com). Tant qu'ils ne sont pas configurés sur Railway, les endpoints de
+// paiement répondent "non configuré" et l'app continue de fonctionner en mode démonstration
+// (abonnement/Coins instantanés) comme avant, pour ne jamais bloquer le reste de l'application.
+const CINETPAY_API_KEY = process.env.CINETPAY_API_KEY || "";
+const CINETPAY_SITE_ID = process.env.CINETPAY_SITE_ID || "";
+const CINETPAY_CURRENCY = process.env.CINETPAY_CURRENCY || "XAF"; // XAF (CEMAC : Cameroun, Gabon...), XOF (UEMOA), CDF, GNF, USD
+const CINETPAY_BASE_URL = "https://api-checkout.cinetpay.com/v2";
+// URL publique du backend (pour notify_url) et du frontend (pour return_url) — à définir sur Railway.
+const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://lovinia.fr";
+// notify_url doit être une URL absolue joignable par CinetPay : sans BACKEND_PUBLIC_URL configuré,
+// le webhook ne peut jamais nous notifier, donc on désactive le paiement réel plutôt que de créer
+// des transactions qui resteraient "pending" indéfiniment.
+const CINETPAY_ENABLED = !!(CINETPAY_API_KEY && CINETPAY_SITE_ID && BACKEND_PUBLIC_URL);
+
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 }
@@ -203,6 +220,25 @@ CREATE TABLE IF NOT EXISTS revoked_tokens (
   user_id INTEGER NOT NULL,
   revoked_at TEXT DEFAULT CURRENT_TIMESTAMP,
   expires_at TEXT
+);
+
+-- Paiements réels (abonnements et packs de Coins) via l'agrégateur Mobile Money CinetPay.
+-- "status" fait toujours foi côté serveur (jamais le contenu brut du webhook) : on ne passe
+-- à 'accepted' qu'après avoir interrogé l'API /v2/payment/check de CinetPay avec transaction_id.
+CREATE TABLE IF NOT EXISTS payment_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  transaction_id TEXT UNIQUE NOT NULL,
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL, -- 'subscription' | 'coins'
+  plan_key TEXT,       -- si kind = 'subscription'
+  pack_key TEXT,        -- si kind = 'coins'
+  coins_amount INTEGER, -- si kind = 'coins'
+  amount REAL NOT NULL,
+  currency TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'accepted' | 'refused' | 'cancelled'
+  payment_method TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 `);
 
@@ -424,12 +460,12 @@ function dailyLikeLimit(genre) {
 }
 
 // ---------- Packs d'abonnement ----------
-// NOTE : le paiement réel (carte, Mobile Money, Google Play Billing) n'est pas encore branché.
-// Pour l'instant, s'abonner active immédiatement le pack (comme les Coins), en attendant l'intégration
-// d'un vrai moyen de paiement — obligatoire via Google Play Billing pour toute vente sur Android.
+// priceXAF : prix affiché/facturé en Mobile Money (CEMAC). Conversion approximative depuis
+// priceUSD au moment de l'écriture — À AJUSTER par l'équipe Lovinia selon le taux réel souhaité,
+// ce ne sont que des valeurs de départ raisonnables, pas un taux de change officiel figé.
 const SUBSCRIPTION_PLANS = {
   gold: {
-    name: "Pack Gold", priceUSD: 5,
+    name: "Pack Gold", priceUSD: 5, priceXAF: 3000,
     features: [
       "Publier des photos et vidéos privées", "Interrupteur Public/Privé sur chaque contenu",
       "Gestion des contenus privés depuis le profil", "Statistiques des contenus privés",
@@ -437,7 +473,7 @@ const SUBSCRIPTION_PLANS = {
     ],
   },
   premium: {
-    name: "Pack Premium", priceUSD: 10,
+    name: "Pack Premium", priceUSD: 10, priceXAF: 6000,
     features: [
       "Matchs illimités", "Mise en avant du profil", "Voir qui a aimé ton profil",
       "Filtres avancés", "Priorité dans les recherches", "Boost du profil",
@@ -445,7 +481,7 @@ const SUBSCRIPTION_PLANS = {
     ],
   },
   vip: {
-    name: "Pack VIP", priceUSD: 15,
+    name: "Pack VIP", priceUSD: 15, priceXAF: 9000,
     features: [
       "Tous les avantages Premium", "Consultation des photos et vidéos privées",
       "Accès aux contenus réservés VIP", "Cadeaux VIP exclusifs", "Bonus mensuel de LoviCoins",
@@ -453,6 +489,76 @@ const SUBSCRIPTION_PLANS = {
     ],
   },
 };
+
+// ---------- Packs de Coins (achat réel) ----------
+// Mêmes réserves que ci-dessus sur les prix XAF : valeurs de départ, ajustables librement.
+const COIN_PACKS = {
+  pack_500: { coins: 500, priceXAF: 1000 },
+  pack_1200: { coins: 1200, priceXAF: 2000 },
+  pack_3000: { coins: 3000, priceXAF: 4500 },
+  pack_7000: { coins: 7000, priceXAF: 10000 },
+};
+
+// ---------- CinetPay : initier un paiement et vérifier son statut ----------
+// Documentation : https://docs.cinetpay.com (Checkout API v2 / SeamlessPay).
+// IMPORTANT : on ne fait jamais confiance au contenu du webhook notify_url pour créditer un
+// compte — on rappelle systématiquement /v2/payment/check avec transaction_id pour obtenir le
+// statut qui fait foi, comme recommandé par CinetPay pour éviter toute falsification côté client.
+async function cinetpayInitPayment({ transactionId, amount, description, customerId }) {
+  const body = {
+    apikey: CINETPAY_API_KEY,
+    site_id: CINETPAY_SITE_ID,
+    transaction_id: transactionId,
+    amount,
+    currency: CINETPAY_CURRENCY,
+    description,
+    notify_url: `${BACKEND_PUBLIC_URL}/api/payments/notify`,
+    return_url: `${FRONTEND_URL}/payment-return?transaction_id=${transactionId}`,
+    channels: "MOBILE_MONEY",
+    customer_id: String(customerId),
+    lang: "fr",
+  };
+  const res = await fetch(`${CINETPAY_BASE_URL}/payment`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok || data.code !== "201" || !data.data?.payment_url) {
+    throw new Error(data.description || data.message || "Impossible d'initier le paiement CinetPay.");
+  }
+  return { paymentUrl: data.data.payment_url, paymentToken: data.data.payment_token };
+}
+
+async function cinetpayCheckTransaction(transactionId) {
+  const res = await fetch(`${CINETPAY_BASE_URL}/payment/check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apikey: CINETPAY_API_KEY, site_id: CINETPAY_SITE_ID, transaction_id: transactionId }),
+  });
+  const data = await res.json();
+  return data; // data.code === "00" && data.data?.status === "ACCEPTED" => paiement confirmé
+}
+
+// Applique les effets d'un paiement confirmé (créditer des Coins ou activer un abonnement),
+// de façon idempotente : si la transaction est déjà "accepted" en base, on ne rejoue rien.
+function applyConfirmedPayment(tx) {
+  const already = db.prepare("SELECT status FROM payment_transactions WHERE transaction_id = ?").get(tx.transaction_id);
+  if (!already || already.status === "accepted") return; // déjà traité (ou transaction inconnue)
+  const apply = db.transaction(() => {
+    if (tx.kind === "coins" && tx.coins_amount) {
+      db.prepare("UPDATE users SET coins = COALESCE(coins, 0) + ? WHERE id = ?").run(tx.coins_amount, tx.user_id);
+      db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)")
+        .run(tx.user_id, tx.coins_amount, `Achat de Coins (${tx.pack_key}) via Mobile Money`);
+    } else if (tx.kind === "subscription" && tx.plan_key) {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 30);
+      db.prepare("UPDATE users SET plan = ?, plan_expires_at = ? WHERE id = ?").run(tx.plan_key, expiresAt.toISOString(), tx.user_id);
+    }
+    db.prepare("UPDATE payment_transactions SET status = 'accepted', updated_at = datetime('now') WHERE transaction_id = ?").run(tx.transaction_id);
+  });
+  apply();
+}
 
 function isPremiumOrAbove(plan) { return plan === "premium" || plan === "vip"; }
 function isGoldOrAbove(plan) { return plan === "gold" || plan === "vip"; }
@@ -503,6 +609,8 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+// CinetPay envoie sa notification de paiement (notify_url) en x-www-form-urlencoded.
+app.use(express.urlencoded({ extended: true }));
 
 // ---------- Anti-abus (rate limiting) ----------
 // Fait maison, sans dépendance externe : limite le nombre de requêtes par fenêtre de temps.
@@ -1891,6 +1999,113 @@ app.post("/api/unsubscribe", authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+// ---------- Paiement réel (Mobile Money via CinetPay) ----------
+
+// Indique au frontend si le vrai paiement est configuré, et donne le catalogue de packs de Coins.
+// Tant que CINETPAY_API_KEY / CINETPAY_SITE_ID ne sont pas définis sur Railway, enabled = false
+// et le frontend continue d'utiliser /api/subscribe (activation immédiate, mode démonstration).
+app.get("/api/payments/config", (req, res) => {
+  res.json({ enabled: CINETPAY_ENABLED, currency: CINETPAY_CURRENCY, coinPacks: COIN_PACKS });
+});
+
+// Initier le paiement réel d'un abonnement (redirige ensuite vers payment_url).
+app.post("/api/payments/subscribe/init", authMiddleware, async (req, res) => {
+  if (!CINETPAY_ENABLED) return res.status(503).json({ error: "Le paiement réel n'est pas encore configuré côté serveur." });
+  const planKey = req.body?.plan;
+  const plan = SUBSCRIPTION_PLANS[planKey];
+  if (!plan) return res.status(400).json({ error: "Pack inconnu." });
+  // CinetPay interdit certains caractères spéciaux (#, /, $, _, &) dans transaction_id : on ne
+  // garde que des lettres et des chiffres.
+  const transactionId = `sub${req.userId}t${Date.now()}${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    db.prepare(
+      `INSERT INTO payment_transactions (transaction_id, user_id, kind, plan_key, amount, currency, status)
+       VALUES (?, ?, 'subscription', ?, ?, ?, 'pending')`
+    ).run(transactionId, req.userId, planKey, plan.priceXAF, CINETPAY_CURRENCY);
+    const { paymentUrl } = await cinetpayInitPayment({
+      transactionId, amount: plan.priceXAF, description: `Lovinia — ${plan.name} (1 mois)`, customerId: req.userId,
+    });
+    res.json({ paymentUrl, transactionId });
+  } catch (e) {
+    db.prepare("DELETE FROM payment_transactions WHERE transaction_id = ? AND status = 'pending'").run(transactionId);
+    console.error("Erreur d'initialisation de paiement CinetPay (abonnement) :", e);
+    res.status(502).json({ error: "Impossible de contacter le service de paiement Mobile Money pour l'instant. Réessaie dans un instant." });
+  }
+});
+
+// Initier le paiement réel d'un pack de Coins.
+app.post("/api/payments/coins/init", authMiddleware, async (req, res) => {
+  if (!CINETPAY_ENABLED) return res.status(503).json({ error: "Le paiement réel n'est pas encore configuré côté serveur." });
+  const packKey = req.body?.pack;
+  const pack = COIN_PACKS[packKey];
+  if (!pack) return res.status(400).json({ error: "Pack de Coins inconnu." });
+  const transactionId = `coins${req.userId}t${Date.now()}${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    db.prepare(
+      `INSERT INTO payment_transactions (transaction_id, user_id, kind, pack_key, coins_amount, amount, currency, status)
+       VALUES (?, ?, 'coins', ?, ?, ?, ?, 'pending')`
+    ).run(transactionId, req.userId, packKey, pack.coins, pack.priceXAF, CINETPAY_CURRENCY);
+    const { paymentUrl } = await cinetpayInitPayment({
+      transactionId, amount: pack.priceXAF, description: `Lovinia — ${pack.coins} Coins`, customerId: req.userId,
+    });
+    res.json({ paymentUrl, transactionId });
+  } catch (e) {
+    db.prepare("DELETE FROM payment_transactions WHERE transaction_id = ? AND status = 'pending'").run(transactionId);
+    console.error("Erreur d'initialisation de paiement CinetPay (Coins) :", e);
+    res.status(502).json({ error: "Impossible de contacter le service de paiement Mobile Money pour l'instant. Réessaie dans un instant." });
+  }
+});
+
+// Webhook CinetPay (notify_url). CinetPay peut appeler en GET ou en POST : on répond 200
+// immédiatement dans tous les cas (sinon CinetPay considère l'appel en échec et réessaie),
+// puis on vérifie le statut réel de façon asynchrone avant de créditer quoi que ce soit.
+async function handleCinetpayNotify(req, res) {
+  res.sendStatus(200);
+  const transactionId = req.body?.cpm_trans_id || req.query?.cpm_trans_id;
+  if (!transactionId || !CINETPAY_ENABLED) return;
+  try {
+    const data = await cinetpayCheckTransaction(transactionId);
+    const tx = db.prepare("SELECT * FROM payment_transactions WHERE transaction_id = ?").get(transactionId);
+    if (!tx) return;
+    if (data.code === "00" && data.data?.status === "ACCEPTED") {
+      db.prepare("UPDATE payment_transactions SET payment_method = ?, updated_at = datetime('now') WHERE transaction_id = ?")
+        .run(data.data?.payment_method || null, transactionId);
+      applyConfirmedPayment(tx);
+    } else if (tx.status === "pending") {
+      db.prepare("UPDATE payment_transactions SET status = 'refused', updated_at = datetime('now') WHERE transaction_id = ?").run(transactionId);
+    }
+  } catch (e) {
+    console.error("Erreur de vérification CinetPay (notify_url) :", e.message);
+  }
+}
+app.post("/api/payments/notify", handleCinetpayNotify);
+app.get("/api/payments/notify", handleCinetpayNotify);
+
+// Le frontend interroge ce endpoint après avoir été redirigé sur return_url, pour savoir si le
+// paiement est confirmé. Si la transaction est encore "pending" (le webhook peut mettre quelques
+// secondes, ou ne pas être joignable en local), on revérifie nous-mêmes auprès de CinetPay avant
+// de répondre, plutôt que de faire attendre l'utilisateur indéfiniment.
+app.get("/api/payments/status/:transactionId", authMiddleware, async (req, res) => {
+  const tx = db.prepare("SELECT * FROM payment_transactions WHERE transaction_id = ? AND user_id = ?").get(req.params.transactionId, req.userId);
+  if (!tx) return res.status(404).json({ error: "Transaction introuvable." });
+  if (tx.status === "pending" && CINETPAY_ENABLED) {
+    try {
+      const data = await cinetpayCheckTransaction(tx.transaction_id);
+      if (data.code === "00" && data.data?.status === "ACCEPTED") {
+        applyConfirmedPayment(tx);
+        return res.json({ status: "accepted", kind: tx.kind, planKey: tx.plan_key, coinsAmount: tx.coins_amount });
+      }
+      if (data.data?.status === "REFUSED" || data.code === "627") {
+        db.prepare("UPDATE payment_transactions SET status = 'refused', updated_at = datetime('now') WHERE transaction_id = ?").run(tx.transaction_id);
+        return res.json({ status: "refused" });
+      }
+    } catch {
+      // On garde le statut "pending" connu en base si CinetPay ne répond pas pour l'instant.
+    }
+  }
+  res.json({ status: tx.status, kind: tx.kind, planKey: tx.plan_key, coinsAmount: tx.coins_amount });
+});
+
 // Tableau de bord créateur (réservé aux détenteurs du Pack Gold ou VIP)
 app.get("/api/me/creator-dashboard", authMiddleware, (req, res) => {
   const user = db.prepare("SELECT plan, creator_balance FROM users WHERE id = ?").get(req.userId);
@@ -2069,6 +2284,7 @@ app.listen(PORT, () => {
     "BREVO_API_KEY", "EMAIL_FROM", "EMAIL_FROM_NAME", "FRONTEND_URL",
     "JWT_SECRET", "ADMIN_SECRET", "DB_PATH", "GOOGLE_CLIENT_ID",
     "VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY",
+    "CINETPAY_API_KEY", "CINETPAY_SITE_ID", "CINETPAY_CURRENCY", "BACKEND_PUBLIC_URL",
   ];
   console.log("========== [DIAGNOSTIC] État des variables d'environnement ==========");
   for (const key of expectedVars) {
@@ -2080,4 +2296,13 @@ app.listen(PORT, () => {
     }
   }
   console.log("=======================================================================");
+  if ((process.env.CINETPAY_API_KEY || process.env.CINETPAY_SITE_ID) && !CINETPAY_ENABLED) {
+    console.warn(
+      "[CinetPay] CINETPAY_API_KEY/CINETPAY_SITE_ID détectés mais le paiement réel reste DÉSACTIVÉ : " +
+      "BACKEND_PUBLIC_URL doit aussi être défini (URL publique de ce backend, ex: https://dating-app-backend-production-xxxx.up.railway.app) " +
+      "pour que CinetPay puisse notifier notify_url."
+    );
+  } else if (CINETPAY_ENABLED) {
+    console.log("[CinetPay] Paiement réel Mobile Money activé.");
+  }
 });
