@@ -367,6 +367,16 @@ try {
 } catch (e) {
   // Déjà présente, rien à faire.
 }
+// "monetized" : publications de la section "Contenu monétisé", gratuite pour tous (pas besoin du
+// Pack Gold ni de badge vérifié pour publier), toujours visibles publiquement (pas de verrou VIP
+// comme pour is_private), mais dont les cadeaux reçus créditent creator_balance (retirable en
+// argent réel) plutôt que les Coins classiques. Distincte de "is_private", qui reste l'ancien
+// mécanisme de contenu exclusif réservé au Pack Gold/VIP, laissé inchangé pour compatibilité.
+try {
+  db.exec(`ALTER TABLE posts ADD COLUMN monetized INTEGER DEFAULT 0`);
+} catch (e) {
+  // Déjà présente, rien à faire.
+}
 try {
   db.exec(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`);
   db.exec(`ALTER TABLE users ADD COLUMN email_verify_token TEXT`);
@@ -465,11 +475,13 @@ function dailyLikeLimit(genre) {
 // ce ne sont que des valeurs de départ raisonnables, pas un taux de change officiel figé.
 const SUBSCRIPTION_PLANS = {
   gold: {
+    // NOTE Lovinia : depuis l'introduction du "Contenu monétisé" gratuit (publication, gains et
+    // retrait ouverts à tous, sans Pack Gold), l'ancienne liste d'avantages Gold (qui portait
+    // uniquement sur la publication de contenu privé) n'est plus un argument de vente valable —
+    // à redéfinir. Liste temporaire en attendant une décision produit.
     name: "Pack Gold", priceUSD: 5, priceXAF: 3000,
     features: [
-      "Publier des photos et vidéos privées", "Interrupteur Public/Privé sur chaque contenu",
-      "Gestion des contenus privés depuis le profil", "Statistiques des contenus privés",
-      "Réception de cadeaux sur les contenus privés", "Demande de retrait des gains",
+      "Badge Gold sur le profil", "Support client prioritaire",
     ],
   },
   premium: {
@@ -1367,7 +1379,7 @@ function decoratePost(post, requesterId) {
 
 // Créer une publication (photo ou vidéo) sur son propre profil
 app.post("/api/posts", authMiddleware, (req, res) => {
-  const { mediaUrl, mediaType, caption, isPrivate } = req.body || {};
+  const { mediaUrl, mediaType, caption, isPrivate, monetized } = req.body || {};
   if (!mediaUrl) return res.status(400).json({ error: "Média manquant." });
   const type = mediaType === "video" ? "video" : "photo";
 
@@ -1382,18 +1394,46 @@ app.post("/api/posts", authMiddleware, (req, res) => {
     }
     privateFlag = 1;
   }
+  // "Contenu monétisé" : gratuit et ouvert à tous, aucun pack ni badge vérifié requis pour publier.
+  const monetizedFlag = monetized ? 1 : 0;
 
   const result = db
-    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption, is_private) VALUES (?, ?, ?, ?, ?)")
-    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500), privateFlag);
+    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption, is_private, monetized) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500), privateFlag, monetizedFlag);
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(result.lastInsertRowid);
   res.json({ post: decoratePost(post, req.userId) });
 });
 
-// Mes propres publications (pour les gérer)
+// Mes propres publications (pour les gérer). Chaque publication est décorée avec coinsEarned
+// (part créateur des cadeaux reçus sur cette publication précise) pour l'écran "Contenu monétisé".
 app.get("/api/posts/mine", authMiddleware, (req, res) => {
   const rows = db.prepare("SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC").all(req.userId);
-  res.json({ posts: rows.map((p) => decoratePost(p, req.userId)) });
+  const coinsByPost = db
+    .prepare(
+      `SELECT gs.post_id as postId, COALESCE(SUM(g.price_coins), 0) as totalPrice
+       FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id
+       WHERE gs.post_id IN (SELECT id FROM posts WHERE user_id = ?)
+       GROUP BY gs.post_id`
+    )
+    .all(req.userId);
+  const coinsMap = new Map(coinsByPost.map((r) => [r.postId, Math.floor(r.totalPrice * GIFT_RECIPIENT_SHARE)]));
+  res.json({ posts: rows.map((p) => ({ ...decoratePost(p, req.userId), coinsEarned: coinsMap.get(p.id) || 0 })) });
+});
+
+// Résumé "Contenu monétisé" : total des Coins gagnés grâce aux publications, tous posts confondus.
+app.get("/api/me/monetized-summary", authMiddleware, (req, res) => {
+  const postCount = db.prepare("SELECT COUNT(*) c FROM posts WHERE user_id = ?").get(req.userId).c;
+  const totalPrice = db
+    .prepare(
+      `SELECT COALESCE(SUM(g.price_coins), 0) as totalPrice
+       FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id
+       WHERE gs.post_id IN (SELECT id FROM posts WHERE user_id = ?)`
+    )
+    .get(req.userId).totalPrice;
+  const giftCount = db
+    .prepare("SELECT COUNT(*) c FROM gifts_sent WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)")
+    .get(req.userId).c;
+  res.json({ postCount, giftCount, coinsEarned: Math.floor(totalPrice * GIFT_RECIPIENT_SHARE) });
 });
 
 // Publications d'un autre utilisateur (affichées sur son profil)
@@ -1546,7 +1586,20 @@ app.get("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
     )
     .all(req.params.postId);
   const total = rows.reduce((sum, r) => sum + r.count, 0);
-  res.json({ gifts: rows, total });
+  // Les Coins gagnés (part créateur, 70% du prix des cadeaux) ne sont visibles que par le propriétaire
+  // de la publication — les autres visiteurs voient juste le nombre de cadeaux, pas les gains en Coins.
+  let coinsEarned = null;
+  if (post.user_id === req.userId) {
+    coinsEarned = db
+      .prepare(
+        `SELECT COALESCE(SUM(g.price_coins), 0) as totalPrice
+         FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id
+         WHERE gs.post_id = ?`
+      )
+      .get(req.params.postId).totalPrice;
+    coinsEarned = Math.floor(coinsEarned * GIFT_RECIPIENT_SHARE);
+  }
+  res.json({ gifts: rows, total, coinsEarned });
 });
 
 // Envoyer un cadeau sur une publication
@@ -1590,13 +1643,15 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(gift.price_coins, req.userId);
   db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -gift.price_coins, `Cadeau envoyé : ${gift.name}`);
 
-  // Sur du contenu privé, le gain va au solde créateur (retirable), pas aux Coins classiques (dépensables dans l'app).
-  if (post.is_private) {
+  // Sur du contenu privé (Pack Gold/VIP) OU du "Contenu monétisé" (gratuit, ouvert à tous), le gain
+  // va au solde créateur (retirable en argent réel), pas aux Coins classiques (dépensables dans l'app).
+  const isCreatorContent = !!(post.is_private || post.monetized);
+  if (isCreatorContent) {
     db.prepare("UPDATE users SET creator_balance = creator_balance + ? WHERE id = ?").run(recipientGain, recipient.id);
   } else {
     db.prepare("UPDATE users SET coins = coins + ? WHERE id = ?").run(recipientGain, recipient.id);
   }
-  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipient.id, recipientGain, `Cadeau reçu : ${gift.name}${post.is_private ? " (contenu privé)" : ""}`);
+  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(recipient.id, recipientGain, `Cadeau reçu : ${gift.name}${isCreatorContent ? " (contenu monétisé)" : ""}`);
 
   db.prepare("INSERT INTO gifts_sent (sender_id, recipient_id, post_id, gift_id) VALUES (?, ?, ?, ?)").run(req.userId, recipient.id, post.id, gift.id);
   db.prepare("INSERT INTO platform_revenue (amount, source, reference_id) VALUES (?, ?, ?)").run(platformShare, `Commission cadeau : ${gift.name}`, gift.id);
@@ -2106,13 +2161,12 @@ app.get("/api/payments/status/:transactionId", authMiddleware, async (req, res) 
   res.json({ status: tx.status, kind: tx.kind, planKey: tx.plan_key, coinsAmount: tx.coins_amount });
 });
 
-// Tableau de bord créateur (réservé aux détenteurs du Pack Gold ou VIP)
+// Tableau de bord créateur — ouvert à tous (le Pack Gold n'est plus requis depuis l'introduction
+// du "Contenu monétisé" gratuit) : inclut à la fois l'ancien contenu privé (Gold/VIP) et les
+// publications "Contenu monétisé", les deux créditant creator_balance de la même façon.
 app.get("/api/me/creator-dashboard", authMiddleware, (req, res) => {
   const user = db.prepare("SELECT plan, creator_balance FROM users WHERE id = ?").get(req.userId);
-  if (!isGoldOrAbove(user?.plan)) {
-    return res.status(403).json({ error: "Le Pack Gold est nécessaire pour accéder au tableau de bord créateur." });
-  }
-  const privatePosts = db.prepare("SELECT * FROM posts WHERE user_id = ? AND is_private = 1 ORDER BY created_at DESC").all(req.userId);
+  const privatePosts = db.prepare("SELECT * FROM posts WHERE user_id = ? AND (is_private = 1 OR monetized = 1) ORDER BY created_at DESC").all(req.userId);
   const postsWithStats = privatePosts.map((p) => {
     const gifts = db
       .prepare(
@@ -2125,7 +2179,7 @@ app.get("/api/me/creator-dashboard", authMiddleware, (req, res) => {
   });
   const totalGiftsReceived = db
     .prepare(
-      `SELECT COUNT(*) c FROM gifts_sent gs JOIN posts p ON p.id = gs.post_id WHERE gs.recipient_id = ? AND p.is_private = 1`
+      `SELECT COUNT(*) c FROM gifts_sent gs JOIN posts p ON p.id = gs.post_id WHERE gs.recipient_id = ? AND (p.is_private = 1 OR p.monetized = 1)`
     )
     .get(req.userId).c;
   const withdrawals = db
@@ -2139,12 +2193,9 @@ app.get("/api/me/creator-dashboard", authMiddleware, (req, res) => {
   });
 });
 
-// Demander un retrait des gains créateur
+// Demander un retrait des gains créateur — ouvert à tous, plus besoin du Pack Gold.
 app.post("/api/me/withdraw", authMiddleware, (req, res) => {
   const user = db.prepare("SELECT plan, creator_balance FROM users WHERE id = ?").get(req.userId);
-  if (!isGoldOrAbove(user?.plan)) {
-    return res.status(403).json({ error: "Le Pack Gold est nécessaire pour demander un retrait." });
-  }
   const amount = Math.floor(req.body?.amount);
   if (!amount || amount <= 0) return res.status(400).json({ error: "Montant invalide." });
   if (amount > (user.creator_balance || 0)) {
