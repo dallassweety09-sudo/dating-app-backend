@@ -1047,8 +1047,14 @@ app.get("/api/discover", authMiddleware, (req, res) => {
     maxDistance = "", ville = "", pays = "",
   } = req.query;
 
+  // Un "pass" (croix, pas intéressé) n'exclut le profil que pendant 10 minutes, comme sur Tinder :
+  // passé ce délai, le profil peut réapparaître automatiquement dans la découverte. Un "like" ou
+  // "superlike" reste exclu définitivement (pas de raison de le reproposer une fois déjà liké).
   const alreadySwiped = db
-    .prepare("SELECT to_user_id FROM swipes WHERE from_user_id = ?")
+    .prepare(
+      `SELECT to_user_id FROM swipes
+       WHERE from_user_id = ? AND (action != 'pass' OR created_at > datetime('now', '-10 minutes'))`
+    )
     .all(req.userId)
     .map((r) => r.to_user_id);
 
@@ -1199,9 +1205,11 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -SUPERLIKE_COST, "Super Like envoyé");
   }
 
+  // On rafraîchit aussi created_at à chaque nouveau swipe (y compris en cas de re-pass après
+  // réapparition automatique) : sinon le délai de 10 minutes ne repartirait jamais de zéro.
   db.prepare(
-    `INSERT INTO swipes (from_user_id, to_user_id, action) VALUES (?, ?, ?)
-     ON CONFLICT(from_user_id, to_user_id) DO UPDATE SET action = excluded.action`
+    `INSERT INTO swipes (from_user_id, to_user_id, action, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(from_user_id, to_user_id) DO UPDATE SET action = excluded.action, created_at = CURRENT_TIMESTAMP`
   ).run(req.userId, toUserId, action);
 
   let matched = false;
