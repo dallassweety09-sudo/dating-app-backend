@@ -1262,6 +1262,15 @@ app.post("/api/swipe/undo", authMiddleware, (req, res) => {
   res.json({ restored: profile || null });
 });
 
+// Bouton "Actualiser" du Swipe : recharge immédiatement tous les profils que l'utilisateur a
+// passés (croix), sans attendre les 10 minutes de réapparition automatique. On ne supprime que
+// les swipes 'pass' — les like/superlike restent intacts, donc les profils déjà matchés, ou déjà
+// likés/superlikés, ne reviennent jamais dans le deck via ce bouton.
+app.post("/api/swipe/reset-passes", authMiddleware, (req, res) => {
+  const info = db.prepare("DELETE FROM swipes WHERE from_user_id = ? AND action = 'pass'").run(req.userId);
+  res.json({ success: true, restoredCount: info.changes });
+});
+
 // ---------- Matchs ----------
 app.get("/api/matches", authMiddleware, (req, res) => {
   const rows = db
@@ -1763,6 +1772,51 @@ app.get("/api/notifications/summary", authMiddleware, (req, res) => {
     )
     .get(req.userId, req.userId, req.userId);
   res.json({ unreadMessages: row.unread });
+});
+
+// Bouton "Message" directement sur la fiche de découverte : si les deux personnes sont déjà
+// matchées, on rouvre simplement cette conversation (accessible à tout le monde, gratuit ou pas).
+// Sinon, seul un utilisateur avec un plan payant (Premium/VIP/Gold — donc "plan !== 'free'") peut
+// créer la conversation sans match préalable ; un utilisateur gratuit reçoit une erreur explicite
+// avec le code MATCH_REQUIRED que le frontend affiche comme message d'incitation à l'abonnement.
+app.post("/api/messages/start/:userId", authMiddleware, (req, res) => {
+  const targetId = Number(req.params.userId);
+  if (!targetId || targetId === req.userId) {
+    return res.status(400).json({ error: "Paramètre invalide." });
+  }
+  const target = db.prepare("SELECT id, name, img FROM users WHERE id = ?").get(targetId);
+  if (!target) return res.status(404).json({ error: "Profil introuvable." });
+
+  const blocked = db
+    .prepare(
+      "SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)"
+    )
+    .get(req.userId, targetId, targetId, req.userId);
+  if (blocked) return res.status(403).json({ error: "Action impossible." });
+
+  const [a, b] = [req.userId, targetId].sort((x, y) => x - y);
+  let match = db.prepare("SELECT id FROM matches WHERE user_a_id = ? AND user_b_id = ?").get(a, b);
+
+  if (!match) {
+    const user = db.prepare("SELECT plan FROM users WHERE id = ?").get(req.userId);
+    const isPremium = user?.plan && user.plan !== "free";
+    if (!isPremium) {
+      return res.status(403).json({
+        error: "Vous devez être matché avec cette personne pour lui écrire. Passez en Premium pour pouvoir envoyer des messages sans match préalable.",
+        code: "MATCH_REQUIRED",
+      });
+    }
+    const info = db.prepare("INSERT INTO matches (user_a_id, user_b_id) VALUES (?, ?)").run(a, b);
+    match = { id: info.lastInsertRowid };
+    const me = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+    sendPushToUser(targetId, {
+      title: "Nouveau message sur Lovinia 💬",
+      body: `${me?.name || "Quelqu'un"} t'a envoyé un message.`,
+      url: "/",
+    }).catch(() => {});
+  }
+
+  res.json({ matchId: match.id, id: target.id, name: target.name, img: target.img });
 });
 
 // ---------- Messages ----------
