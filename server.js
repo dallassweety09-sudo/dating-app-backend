@@ -1248,6 +1248,14 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
   }
 
   if (action === "superlike") {
+    // Le Super Like est réservé aux membres Premium (et au-dessus) — un compte gratuit reçoit un
+    // message d'incitation élégant plutôt qu'un simple refus technique.
+    if (!isPremium) {
+      return res.status(403).json({
+        error: "Le Super Like est réservé aux membres Premium. Passe à un plan supérieur pour faire savoir instantanément à quelqu'un qu'il te plaît.",
+        code: "SUPERLIKE_REQUIRES_PREMIUM",
+      });
+    }
     if ((user?.coins || 0) < SUPERLIKE_COST) {
       return res.status(402).json({ error: "Pas assez de Lovinia Coins pour un Super Like.", code: "INSUFFICIENT_COINS", cost: SUPERLIKE_COST });
     }
