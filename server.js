@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS payment_transactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   transaction_id TEXT UNIQUE NOT NULL,
   user_id INTEGER NOT NULL,
-  kind TEXT NOT NULL, -- 'subscription' | 'coins'
+  kind TEXT NOT NULL, -- 'subscription' | 'coins' | 'matchmaking'
   plan_key TEXT,       -- si kind = 'subscription'
   pack_key TEXT,        -- si kind = 'coins'
   coins_amount INTEGER, -- si kind = 'coins'
@@ -239,6 +239,45 @@ CREATE TABLE IF NOT EXISTS payment_transactions (
   payment_method TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Lovinia Matchmaking : service premium payant (abonnement annuel séparé du plan Premium/VIP
+-- classique) de mise en relation personnalisée. Un profil de recherche détaillé, distinct du
+-- profil de découverte habituel, sert soit à la recherche autonome entre membres, soit à la
+-- curation manuelle de mises en relation par l'équipe Lovinia (mode "accompagné").
+CREATE TABLE IF NOT EXISTS matchmaking_profiles (
+  user_id INTEGER PRIMARY KEY,
+  mode TEXT NOT NULL DEFAULT 'autonome', -- 'autonome' | 'accompagne'
+  visible INTEGER NOT NULL DEFAULT 1,     -- visible par les autres membres (mode autonome)
+  age_min INTEGER,
+  age_max INTEGER,
+  ville TEXT DEFAULT '',
+  pays TEXT DEFAULT '',
+  situation_familiale TEXT DEFAULT '',
+  projet_couple TEXT DEFAULT '',
+  souhait_mariage TEXT DEFAULT '',
+  enfants TEXT DEFAULT '',
+  valeurs TEXT DEFAULT '[]',       -- tableau JSON de valeurs/centres d'intérêt importants
+  personnalite_recherchee TEXT DEFAULT '',
+  distance_max INTEGER,
+  autres_criteres TEXT DEFAULT '',
+  contact_pref TEXT DEFAULT '[]',  -- tableau JSON : "email" | "notification" | "telephone" | "whatsapp"
+  frequence_souhaitee TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Mises en relation proposées manuellement par l'équipe Lovinia (mode "accompagné") :
+-- "Lovinia pense que cette rencontre pourrait vous intéresser". Chaque personne répond
+-- indépendamment ; si les deux acceptent, un vrai match (table matches) est créé.
+CREATE TABLE IF NOT EXISTS matchmaking_suggestions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_a_id INTEGER NOT NULL,
+  user_b_id INTEGER NOT NULL,
+  status_a TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'accepted' | 'declined'
+  status_b TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TEXT
 );
 `);
 
@@ -286,6 +325,8 @@ const newColumns = [
   "private_photos TEXT DEFAULT '[]'",
   "suspended INTEGER DEFAULT 0",
   "travel_active INTEGER DEFAULT 0",
+  "matchmaking_active INTEGER DEFAULT 0",
+  "matchmaking_expires_at TEXT DEFAULT ''",
 ];
 for (const col of newColumns) {
   try {
@@ -502,6 +543,11 @@ const SUBSCRIPTION_PLANS = {
   },
 };
 
+// ---------- Lovinia Matchmaking : abonnement annuel séparé (service premium de mise en relation) ----------
+// priceXAF calculé sur la parité fixe FCFA/Euro (1 EUR = 655.957 XAF, zone CEMAC) : 50 EUR = 32 798 XAF.
+// priceUSD est une conversion approximative (le dollar n'est pas parité fixe), à ajuster librement.
+const MATCHMAKING_PLAN = { name: "Lovinia Matchmaking", priceEUR: 50, priceUSD: 54, priceXAF: 32798, durationDays: 365 };
+
 // ---------- Packs de Coins (achat réel) ----------
 // Mêmes réserves que ci-dessus sur les prix XAF : valeurs de départ, ajustables librement.
 const COIN_PACKS = {
@@ -566,6 +612,10 @@ function applyConfirmedPayment(tx) {
       const expiresAt = new Date();
       expiresAt.setDate(expiresAt.getDate() + 30);
       db.prepare("UPDATE users SET plan = ?, plan_expires_at = ? WHERE id = ?").run(tx.plan_key, expiresAt.toISOString(), tx.user_id);
+    } else if (tx.kind === "matchmaking") {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + MATCHMAKING_PLAN.durationDays);
+      db.prepare("UPDATE users SET matchmaking_active = 1, matchmaking_expires_at = ? WHERE id = ?").run(expiresAt.toISOString(), tx.user_id);
     }
     db.prepare("UPDATE payment_transactions SET status = 'accepted', updated_at = datetime('now') WHERE transaction_id = ?").run(tx.transaction_id);
   });
@@ -2116,6 +2166,262 @@ app.post("/api/unsubscribe", authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+// ---------- Lovinia Matchmaking (service premium de mise en relation, abonnement annuel séparé) ----------
+
+function matchmakingActive(user) {
+  if (!user?.matchmaking_active) return false;
+  if (!user.matchmaking_expires_at) return true; // activé en mode démo sans date (ne devrait pas arriver, mais on ne bloque pas)
+  return new Date(user.matchmaking_expires_at) > new Date();
+}
+
+// Renseigne le prix (démo + réel) et le statut de l'utilisateur connecté (abonné ou non, profil déjà rempli ou non).
+app.get("/api/matchmaking/status", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT matchmaking_active, matchmaking_expires_at FROM users WHERE id = ?").get(req.userId);
+  const profile = db.prepare("SELECT * FROM matchmaking_profiles WHERE user_id = ?").get(req.userId);
+  res.json({
+    plan: MATCHMAKING_PLAN,
+    paymentEnabled: CINETPAY_ENABLED,
+    active: matchmakingActive(user),
+    expiresAt: user?.matchmaking_expires_at || null,
+    hasProfile: !!profile,
+    profile: profile ? { ...profile, valeurs: safeParseArray(profile.valeurs), contact_pref: safeParseArray(profile.contact_pref) } : null,
+  });
+});
+
+// Activation "mode démo" (comme /api/subscribe), en attendant que CinetPay soit configuré,
+// ou pour tester sans passer par un vrai paiement Mobile Money.
+app.post("/api/matchmaking/subscribe", authMiddleware, (req, res) => {
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + MATCHMAKING_PLAN.durationDays);
+  db.prepare("UPDATE users SET matchmaking_active = 1, matchmaking_expires_at = ? WHERE id = ?").run(expiresAt.toISOString(), req.userId);
+  res.json({ success: true, expiresAt: expiresAt.toISOString() });
+});
+
+// Enregistre / met à jour le profil de recherche détaillé et le mode choisi (autonome/accompagné).
+// Réservé aux abonnés actifs du service.
+app.put("/api/matchmaking/profile", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT matchmaking_active, matchmaking_expires_at FROM users WHERE id = ?").get(req.userId);
+  if (!matchmakingActive(user)) {
+    return res.status(403).json({ error: "Abonnement Lovinia Matchmaking requis.", code: "MATCHMAKING_REQUIRED" });
+  }
+  const b = req.body || {};
+  const mode = b.mode === "accompagne" ? "accompagne" : "autonome";
+  const visible = b.visible === false ? 0 : 1;
+  db.prepare(
+    `INSERT INTO matchmaking_profiles
+       (user_id, mode, visible, age_min, age_max, ville, pays, situation_familiale, projet_couple,
+        souhait_mariage, enfants, valeurs, personnalite_recherchee, distance_max, autres_criteres,
+        contact_pref, frequence_souhaitee, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(user_id) DO UPDATE SET
+       mode = excluded.mode, visible = excluded.visible, age_min = excluded.age_min, age_max = excluded.age_max,
+       ville = excluded.ville, pays = excluded.pays, situation_familiale = excluded.situation_familiale,
+       projet_couple = excluded.projet_couple, souhait_mariage = excluded.souhait_mariage, enfants = excluded.enfants,
+       valeurs = excluded.valeurs, personnalite_recherchee = excluded.personnalite_recherchee,
+       distance_max = excluded.distance_max, autres_criteres = excluded.autres_criteres,
+       contact_pref = excluded.contact_pref, frequence_souhaitee = excluded.frequence_souhaitee,
+       updated_at = datetime('now')`
+  ).run(
+    req.userId, mode, visible,
+    Number(b.ageMin) || null, Number(b.ageMax) || null,
+    (b.ville || "").slice(0, 100), (b.pays || "").slice(0, 100),
+    (b.situationFamiliale || "").slice(0, 100), (b.projetCouple || "").slice(0, 200),
+    (b.souhaitMariage || "").slice(0, 50), (b.enfants || "").slice(0, 100),
+    JSON.stringify(Array.isArray(b.valeurs) ? b.valeurs.slice(0, 20) : []),
+    (b.personnaliteRecherchee || "").slice(0, 300),
+    Number(b.distanceMax) || null, (b.autresCriteres || "").slice(0, 500),
+    JSON.stringify(Array.isArray(b.contactPref) ? b.contactPref.slice(0, 10) : []),
+    (b.frequenceSouhaitee || "").slice(0, 50)
+  );
+  res.json({ success: true });
+});
+
+// Liste des autres membres Matchmaking visibles (mode autonome ou accompagné, tant qu'ils sont
+// "visible"), pour la recherche libre. Exclut soi-même et les personnes bloquées, comme /api/discover.
+app.get("/api/matchmaking/members", authMiddleware, (req, res) => {
+  const me = db.prepare("SELECT matchmaking_active, matchmaking_expires_at FROM users WHERE id = ?").get(req.userId);
+  if (!matchmakingActive(me)) {
+    return res.status(403).json({ error: "Abonnement Lovinia Matchmaking requis.", code: "MATCHMAKING_REQUIRED" });
+  }
+  const blockedByMe = db.prepare("SELECT blocked_id FROM blocks WHERE blocker_id = ?").all(req.userId).map((r) => r.blocked_id);
+  const blockedMe = db.prepare("SELECT blocker_id FROM blocks WHERE blocked_id = ?").all(req.userId).map((r) => r.blocker_id);
+  const exclude = [req.userId, ...blockedByMe, ...blockedMe];
+  const placeholders = exclude.map(() => "?").join(",");
+
+  const rows = db
+    .prepare(
+      `SELECT u.id, u.name, u.age, u.genre, u.city, u.country, u.bio, u.img, u.photos, u.interests,
+              u.profession, u.verification_status,
+              mp.mode, mp.situation_familiale, mp.projet_couple, mp.souhait_mariage, mp.enfants, mp.valeurs
+       FROM matchmaking_profiles mp
+       JOIN users u ON u.id = mp.user_id
+       WHERE mp.visible = 1 AND u.id NOT IN (${placeholders})
+         AND u.matchmaking_active = 1
+         AND (u.matchmaking_expires_at = '' OR u.matchmaking_expires_at > datetime('now'))
+         AND (u.suspended IS NULL OR u.suspended = 0)`
+    )
+    .all(...exclude);
+
+  const members = rows.map((r) => ({
+    ...r,
+    photos: safeParseArray(r.photos),
+    interests: safeParseArray(r.interests),
+    valeurs: safeParseArray(r.valeurs),
+  }));
+  res.json({ members });
+});
+
+app.get("/api/matchmaking/members/:id", authMiddleware, (req, res) => {
+  const me = db.prepare("SELECT matchmaking_active, matchmaking_expires_at FROM users WHERE id = ?").get(req.userId);
+  if (!matchmakingActive(me)) {
+    return res.status(403).json({ error: "Abonnement Lovinia Matchmaking requis.", code: "MATCHMAKING_REQUIRED" });
+  }
+  const row = db
+    .prepare(
+      `SELECT u.id, u.name, u.age, u.genre, u.city, u.country, u.bio, u.img, u.photos, u.interests,
+              u.profession, u.verification_status, u.taille, u.langues,
+              mp.mode, mp.situation_familiale, mp.projet_couple, mp.souhait_mariage, mp.enfants, mp.valeurs,
+              mp.personnalite_recherchee, mp.visible
+       FROM matchmaking_profiles mp
+       JOIN users u ON u.id = mp.user_id
+       WHERE u.id = ?`
+    )
+    .get(req.params.id);
+  if (!row || !row.visible) return res.status(404).json({ error: "Profil introuvable." });
+  res.json({
+    member: { ...row, photos: safeParseArray(row.photos), interests: safeParseArray(row.interests), langues: safeParseArray(row.langues), valeurs: safeParseArray(row.valeurs) },
+  });
+});
+
+// Mode "autonome" : contacter directement un autre membre du service (les deux doivent être
+// abonnés actifs). Crée/rouvre la conversation comme la messagerie sans match des comptes payants.
+app.post("/api/matchmaking/contact/:id", authMiddleware, (req, res) => {
+  const targetId = Number(req.params.id);
+  const me = db.prepare("SELECT matchmaking_active, matchmaking_expires_at FROM users WHERE id = ?").get(req.userId);
+  if (!matchmakingActive(me)) {
+    return res.status(403).json({ error: "Abonnement Lovinia Matchmaking requis.", code: "MATCHMAKING_REQUIRED" });
+  }
+  const target = db.prepare("SELECT id, matchmaking_active, matchmaking_expires_at FROM users WHERE id = ?").get(targetId);
+  if (!target || !matchmakingActive(target)) return res.status(404).json({ error: "Ce membre n'est plus disponible." });
+
+  const blocked = db
+    .prepare("SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)")
+    .get(req.userId, targetId, targetId, req.userId);
+  if (blocked) return res.status(403).json({ error: "Action impossible." });
+
+  const [a, b] = [req.userId, targetId].sort((x, y) => x - y);
+  let match = db.prepare("SELECT id FROM matches WHERE user_a_id = ? AND user_b_id = ?").get(a, b);
+  if (!match) {
+    const info = db.prepare("INSERT INTO matches (user_a_id, user_b_id) VALUES (?, ?)").run(a, b);
+    match = { id: info.lastInsertRowid };
+    const meName = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+    sendPushToUser(targetId, {
+      title: "Lovinia Matchmaking 💬",
+      body: `${meName?.name || "Un membre"} souhaite entrer en contact avec toi.`,
+      url: "/",
+    }).catch(() => {});
+  }
+  res.json({ matchId: match.id });
+});
+
+// Mode "accompagné" : liste des mises en relation proposées par l'équipe Lovinia pour l'utilisateur
+// connecté, avec le statut de chacun des deux côtés.
+app.get("/api/matchmaking/suggestions", authMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT s.*,
+         CASE WHEN s.user_a_id = ? THEN s.user_b_id ELSE s.user_a_id END AS other_id,
+         CASE WHEN s.user_a_id = ? THEN s.status_a ELSE s.status_b END AS my_status,
+         CASE WHEN s.user_a_id = ? THEN s.status_b ELSE s.status_a END AS other_status
+       FROM matchmaking_suggestions s
+       WHERE s.user_a_id = ? OR s.user_b_id = ?
+       ORDER BY s.created_at DESC`
+    )
+    .all(req.userId, req.userId, req.userId, req.userId, req.userId);
+
+  const suggestions = rows.map((r) => {
+    const other = db
+      .prepare("SELECT id, name, age, city, country, img, photos, bio, profession, verification_status FROM users WHERE id = ?")
+      .get(r.other_id);
+    return {
+      id: r.id,
+      myStatus: r.my_status,
+      otherStatus: r.other_status,
+      createdAt: r.created_at,
+      profile: other ? { ...other, photos: safeParseArray(other.photos) } : null,
+    };
+  });
+  res.json({ suggestions });
+});
+
+// L'utilisateur accepte ou refuse une mise en relation proposée par Lovinia. Si les deux
+// acceptent, un vrai match (conversation) est créé automatiquement.
+app.post("/api/matchmaking/suggestions/:id/respond", authMiddleware, (req, res) => {
+  const accept = !!req.body?.accept;
+  const s = db.prepare("SELECT * FROM matchmaking_suggestions WHERE id = ?").get(req.params.id);
+  if (!s || (s.user_a_id !== req.userId && s.user_b_id !== req.userId)) {
+    return res.status(404).json({ error: "Proposition introuvable." });
+  }
+  const isA = s.user_a_id === req.userId;
+  const myField = isA ? "status_a" : "status_b";
+  const newStatus = accept ? "accepted" : "declined";
+  db.prepare(`UPDATE matchmaking_suggestions SET ${myField} = ? WHERE id = ?`).run(newStatus, s.id);
+
+  const updated = db.prepare("SELECT * FROM matchmaking_suggestions WHERE id = ?").get(s.id);
+  let matched = false;
+  if (updated.status_a === "accepted" && updated.status_b === "accepted") {
+    const [a, b] = [updated.user_a_id, updated.user_b_id].sort((x, y) => x - y);
+    db.prepare("INSERT OR IGNORE INTO matches (user_a_id, user_b_id) VALUES (?, ?)").run(a, b);
+    db.prepare("UPDATE matchmaking_suggestions SET resolved_at = datetime('now') WHERE id = ?").run(s.id);
+    matched = true;
+    const otherId = isA ? updated.user_b_id : updated.user_a_id;
+    const meName = db.prepare("SELECT name FROM users WHERE id = ?").get(req.userId);
+    sendPushToUser(otherId, {
+      title: "Lovinia Matchmaking 💕",
+      body: `${meName?.name || "Un membre"} a accepté votre mise en relation !`,
+      url: "/",
+    }).catch(() => {});
+  } else if (updated.status_a === "declined" || updated.status_b === "declined") {
+    db.prepare("UPDATE matchmaking_suggestions SET resolved_at = datetime('now') WHERE id = ?").run(s.id);
+  }
+  res.json({ success: true, matched });
+});
+
+// ---------- Administration Lovinia Matchmaking ----------
+// Curation manuelle des mises en relation en mode "accompagné" (pas d'algorithme automatique :
+// un humain de l'équipe Lovinia choisit les paires compatibles à proposer).
+app.get("/api/admin/matchmaking/members", adminMiddleware, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT u.id, u.name, u.age, u.genre, u.city, u.country, u.img,
+              mp.mode, mp.situation_familiale, mp.projet_couple, mp.souhait_mariage, mp.enfants, mp.valeurs, mp.age_min, mp.age_max
+       FROM matchmaking_profiles mp
+       JOIN users u ON u.id = mp.user_id
+       WHERE u.matchmaking_active = 1 AND (u.matchmaking_expires_at = '' OR u.matchmaking_expires_at > datetime('now'))
+       ORDER BY mp.created_at DESC`
+    )
+    .all();
+  res.json({ members: rows.map((r) => ({ ...r, valeurs: safeParseArray(r.valeurs) })) });
+});
+
+app.post("/api/admin/matchmaking/suggest", adminMiddleware, (req, res) => {
+  const userAId = Number(req.body?.userAId);
+  const userBId = Number(req.body?.userBId);
+  if (!userAId || !userBId || userAId === userBId) return res.status(400).json({ error: "Paramètres invalides." });
+  const [a, b] = [userAId, userBId].sort((x, y) => x - y);
+  const info = db
+    .prepare("INSERT INTO matchmaking_suggestions (user_a_id, user_b_id) VALUES (?, ?)")
+    .run(a, b);
+  [a, b].forEach((uid) => {
+    sendPushToUser(uid, {
+      title: "Lovinia pense que cette rencontre pourrait vous intéresser ❤️",
+      body: "Découvrez ce profil sélectionné pour vous dans Lovinia Matchmaking.",
+      url: "/",
+    }).catch(() => {});
+  });
+  res.json({ success: true, suggestionId: info.lastInsertRowid });
+});
+
 // ---------- Paiement réel (Mobile Money via CinetPay) ----------
 
 // Indique au frontend si le vrai paiement est configuré, et donne le catalogue de packs de Coins.
@@ -2169,6 +2475,26 @@ app.post("/api/payments/coins/init", authMiddleware, async (req, res) => {
   } catch (e) {
     db.prepare("DELETE FROM payment_transactions WHERE transaction_id = ? AND status = 'pending'").run(transactionId);
     console.error("Erreur d'initialisation de paiement CinetPay (Coins) :", e);
+    res.status(502).json({ error: "Impossible de contacter le service de paiement Mobile Money pour l'instant. Réessaie dans un instant." });
+  }
+});
+
+// Initier le paiement réel de l'abonnement annuel Lovinia Matchmaking.
+app.post("/api/payments/matchmaking/init", authMiddleware, async (req, res) => {
+  if (!CINETPAY_ENABLED) return res.status(503).json({ error: "Le paiement réel n'est pas encore configuré côté serveur." });
+  const transactionId = `mm${req.userId}t${Date.now()}${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    db.prepare(
+      `INSERT INTO payment_transactions (transaction_id, user_id, kind, amount, currency, status)
+       VALUES (?, ?, 'matchmaking', ?, ?, 'pending')`
+    ).run(transactionId, req.userId, MATCHMAKING_PLAN.priceXAF, CINETPAY_CURRENCY);
+    const { paymentUrl } = await cinetpayInitPayment({
+      transactionId, amount: MATCHMAKING_PLAN.priceXAF, description: "Lovinia Matchmaking — abonnement 1 an", customerId: req.userId,
+    });
+    res.json({ paymentUrl, transactionId });
+  } catch (e) {
+    db.prepare("DELETE FROM payment_transactions WHERE transaction_id = ? AND status = 'pending'").run(transactionId);
+    console.error("Erreur d'initialisation de paiement CinetPay (Matchmaking) :", e);
     res.status(502).json({ error: "Impossible de contacter le service de paiement Mobile Money pour l'instant. Réessaie dans un instant." });
   }
 });
