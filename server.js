@@ -418,6 +418,30 @@ try {
 } catch (e) {
   // Déjà présente, rien à faire.
 }
+// ---------- Refonte du contenu verrouillé (08/2026) ----------
+// "is_private" devient "contenu verrouillé" : n'importe quel créateur vérifié fixe un prix en
+// Lovinia Coins pour le déverrouiller (comme une story payante), au lieu d'être réservé au Pack
+// Gold pour publier / Pack VIP pour voir. Les VIP gardent un accès automatique inclus dans leur
+// abonnement (sans payer de Coins), les autres paient le prix fixé par le créateur une seule fois
+// pour débloquer définitivement ce contenu précis. "monetized" (contenu public gratuit, monétisé
+// uniquement par les cadeaux) n'est pas concerné et reste inchangé.
+try {
+  db.exec(`ALTER TABLE posts ADD COLUMN unlock_price_coins INTEGER DEFAULT 0`);
+  // Anciens contenus déjà marqués "is_private" sans prix : on leur donne un prix de déverrouillage
+  // par défaut pour qu'ils restent achetables plutôt que bloqués sans mécanisme d'achat.
+  db.exec(`UPDATE posts SET unlock_price_coins = 50 WHERE is_private = 1 AND (unlock_price_coins IS NULL OR unlock_price_coins = 0)`);
+} catch (e) {
+  // Déjà présente, rien à faire.
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS post_unlocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    post_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, post_id)
+  )
+`);
 try {
   db.exec(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`);
   db.exec(`ALTER TABLE users ADD COLUMN email_verify_token TEXT`);
@@ -430,6 +454,26 @@ try {
 // La vérification par email est en pause pour le moment : personne ne doit rester bloqué à cause d'elle.
 // Cette ligne s'exécute à chaque démarrage (contrairement à la migration ci-dessus).
 db.exec(`UPDATE users SET email_verified = 1 WHERE email_verified = 0 OR email_verified IS NULL`);
+
+// Suivi du bonus mensuel de Coins VIP ("Bonus mensuel de LoviCoins", promis dans les avantages VIP
+// mais jamais implémenté jusqu'ici) : on note la date du dernier versement pour ne le donner qu'une
+// fois par période de 30 jours, vérifié à la connexion plutôt que via une tâche planifiée fragile.
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN vip_coin_bonus_at TEXT`);
+} catch (e) {
+  // Colonne déjà présente, rien à faire.
+}
+const VIP_MONTHLY_COIN_BONUS = 100;
+function grantVipMonthlyCoinBonusIfDue(userId) {
+  const u = db.prepare("SELECT plan, vip_coin_bonus_at FROM users WHERE id = ?").get(userId);
+  if (!u || !isVip(u.plan)) return;
+  const last = u.vip_coin_bonus_at ? new Date(u.vip_coin_bonus_at) : null;
+  const dueDate = last ? new Date(last.getTime() + 30 * 24 * 60 * 60 * 1000) : new Date(0);
+  if (new Date() < dueDate) return;
+  const now = new Date().toISOString();
+  db.prepare("UPDATE users SET coins = COALESCE(coins, 0) + ?, vip_coin_bonus_at = ? WHERE id = ?").run(VIP_MONTHLY_COIN_BONUS, now, userId);
+  db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(userId, VIP_MONTHLY_COIN_BONUS, "Bonus mensuel VIP");
+}
 
 // ---------- Envoi d'emails transactionnels via l'API HTTP Brevo (gratuit jusqu'à 300 emails/jour) ----------
 // Aucune dépendance npm nécessaire : simple requête HTTPS native.
@@ -514,31 +558,42 @@ function dailyLikeLimit(genre) {
 // priceXAF : prix affiché/facturé en Mobile Money (CEMAC). Conversion approximative depuis
 // priceUSD au moment de l'écriture — À AJUSTER par l'équipe Lovinia selon le taux réel souhaité,
 // ce ne sont que des valeurs de départ raisonnables, pas un taux de change officiel figé.
+// Chaque avantage listé ci-dessous correspond à une vérification réelle dans le code (voir
+// PLAN_TIER / isGoldOrAbove / isPremiumOrAbove / isVip) — on ne liste plus de promesses sans
+// implémentation derrière, pour rester honnête envers les utilisateurs qui paient. Gold < Premium
+// < VIP : chaque palier inclut automatiquement tous les avantages des paliers en dessous.
 const SUBSCRIPTION_PLANS = {
   gold: {
-    // NOTE Lovinia : depuis l'introduction du "Contenu monétisé" gratuit (publication, gains et
-    // retrait ouverts à tous, sans Pack Gold), l'ancienne liste d'avantages Gold (qui portait
-    // uniquement sur la publication de contenu privé) n'est plus un argument de vente valable —
-    // à redéfinir. Liste temporaire en attendant une décision produit.
     name: "Pack Gold", priceUSD: 5, priceXAF: 3000,
     features: [
-      "Badge Gold sur le profil", "Support client prioritaire",
+      "Likes illimités (plus de limite quotidienne)",
+      "Badge Gold sur le profil",
+      "-10% sur l'achat de Lovinia Coins",
+      "Support client prioritaire",
     ],
   },
   premium: {
     name: "Pack Premium", priceUSD: 10, priceXAF: 6000,
     features: [
-      "Matchs illimités", "Mise en avant du profil", "Voir qui a aimé ton profil",
-      "Filtres avancés", "Priorité dans les recherches", "Boost du profil",
-      "Plus de Super Likes", "Badge Premium", "Réduction sur les LoviCoins", "Statistiques détaillées",
+      "Tous les avantages Gold",
+      "Super Like illimité (10 Lovinia Coins par envoi)",
+      "Écrire à quelqu'un sans attendre un match",
+      "Boost de profil deux fois plus long",
+      "Voir qui a aimé ton profil",
+      "Statistiques détaillées (likes, matchs, vues)",
+      "-20% sur l'achat de Lovinia Coins",
+      "Badge Premium",
     ],
   },
   vip: {
     name: "Pack VIP", priceUSD: 15, priceXAF: 9000,
     features: [
-      "Tous les avantages Premium", "Consultation des photos et vidéos privées",
-      "Accès aux contenus réservés VIP", "Cadeaux VIP exclusifs", "Bonus mensuel de LoviCoins",
-      "Badge VIP animé", "Visibilité maximale", "Service client prioritaire",
+      "Tous les avantages Premium",
+      "Contenu verrouillé des autres membres inclus, sans payer de Coins en plus",
+      "100 Lovinia Coins offerts chaque mois",
+      "-30% sur l'achat de Lovinia Coins",
+      "Badge VIP animé",
+      "Service client prioritaire",
     ],
   },
 };
@@ -549,12 +604,16 @@ const SUBSCRIPTION_PLANS = {
 const MATCHMAKING_PLAN = { name: "Lovinia Matchmaking", priceEUR: 50, priceUSD: 54, priceXAF: 32798, durationDays: 365 };
 
 // ---------- Packs de Coins (achat réel) ----------
-// Mêmes réserves que ci-dessus sur les prix XAF : valeurs de départ, ajustables librement.
+// Prix révisés (08/2026) : l'ancien tarif (~1,5-2 FCFA/Coin) rendait les cadeaux et les
+// déverrouillages de contenu quasi gratuits (ex. Rose à 20 Coins ≈ 30-40 FCFA), ce qui laissait
+// aux créateurs une part dérisoire même à 70%. Nouveau tarif ~3 à 5 FCFA/Coin selon la taille du
+// pack (dégressif), pour que les gains des créateurs restent significatifs tout en gardant les
+// prix accessibles en Mobile Money.
 const COIN_PACKS = {
-  pack_500: { coins: 500, priceXAF: 1000 },
-  pack_1200: { coins: 1200, priceXAF: 2000 },
-  pack_3000: { coins: 3000, priceXAF: 4500 },
-  pack_7000: { coins: 7000, priceXAF: 10000 },
+  pack_200: { coins: 200, priceXAF: 1000 },
+  pack_500: { coins: 500, priceXAF: 2000 },
+  pack_1200: { coins: 1200, priceXAF: 4000 },
+  pack_3000: { coins: 3000, priceXAF: 9000 },
 };
 
 // ---------- CinetPay : initier un paiement et vérifier son statut ----------
@@ -622,9 +681,16 @@ function applyConfirmedPayment(tx) {
   apply();
 }
 
-function isPremiumOrAbove(plan) { return plan === "premium" || plan === "vip"; }
-function isGoldOrAbove(plan) { return plan === "gold" || plan === "vip"; }
-function isVip(plan) { return plan === "vip"; }
+// ---------- Hiérarchie des paliers d'abonnement ----------
+// Gold < Premium < VIP, chaque palier hérite des avantages des paliers en dessous.
+// Toutes les vérifications de plan dans ce fichier doivent passer par ces fonctions — ne jamais
+// refaire un test ad hoc du style `plan !== "free"` ailleurs, sinon Gold se retrouve à débloquer
+// des avantages réservés à Premium/VIP sans le vouloir (bug corrigé — voir audit du 08/2026).
+const PLAN_TIER = { free: 0, gold: 1, premium: 2, vip: 3 };
+function planTier(plan) { return PLAN_TIER[plan] || 0; }
+function isGoldOrAbove(plan) { return planTier(plan) >= 1; }
+function isPremiumOrAbove(plan) { return planTier(plan) >= 2; }
+function isVip(plan) { return planTier(plan) >= 3; }
 
 function countTodayLikes(userId) {
   const row = db
@@ -994,6 +1060,7 @@ app.post("/api/auth/resend-verification", authMiddleware, authRateLimit, async (
 
 // ---------- Profile ----------
 app.get("/api/me", authMiddleware, (req, res) => {
+  grantVipMonthlyCoinBonusIfDue(req.userId);
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.userId);
   res.json({ user: publicUser(user) });
 });
@@ -1225,7 +1292,10 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
   }
 
   const user = db.prepare("SELECT genre, plan, coins, email_verified, primary_photo_status FROM users WHERE id = ?").get(req.userId);
-  const isPremium = user?.plan && user.plan !== "free";
+  // Likes illimités : à partir de Gold (palier d'entrée). Super Like : réservé à Premium et au-dessus
+  // (Gold seul n'y donne pas droit) — voir la hiérarchie PLAN_TIER plus haut dans ce fichier.
+  const hasUnlimitedLikes = isGoldOrAbove(user?.plan);
+  const hasSuperlikeAccess = isPremiumOrAbove(user?.plan);
 
   if ((action === "like" || action === "superlike") && user?.primary_photo_status === "rejected") {
     return res.status(403).json({
@@ -1234,7 +1304,7 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     });
   }
 
-  if ((action === "like" || action === "superlike") && !isPremium) {
+  if ((action === "like" || action === "superlike") && !hasUnlimitedLikes) {
     const limit = dailyLikeLimit(user?.genre);
     const used = countTodayLikes(req.userId);
     if (used >= limit) {
@@ -1248,11 +1318,11 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
   }
 
   if (action === "superlike") {
-    // Le Super Like est réservé aux membres Premium (et au-dessus) — un compte gratuit reçoit un
-    // message d'incitation élégant plutôt qu'un simple refus technique.
-    if (!isPremium) {
+    // Le Super Like est réservé aux membres Premium et VIP (Gold seul n'en bénéficie pas) — un
+    // compte gratuit ou Gold reçoit un message d'incitation élégant plutôt qu'un simple refus technique.
+    if (!hasSuperlikeAccess) {
       return res.status(403).json({
-        error: "Le Super Like est réservé aux membres Premium. Passe à un plan supérieur pour faire savoir instantanément à quelqu'un qu'il te plaît.",
+        error: "Le Super Like est réservé aux membres Premium et VIP. Passe à un plan supérieur pour faire savoir instantanément à quelqu'un qu'il te plaît.",
         code: "SUPERLIKE_REQUIRES_PREMIUM",
       });
     }
@@ -1431,6 +1501,10 @@ function areMatched(userA, userB) {
   return !!row;
 }
 
+const UNLOCK_PRICE_MIN = 10;
+const UNLOCK_PRICE_MAX = 500;
+const UNLOCK_PRICE_DEFAULT = 50;
+
 function decoratePost(post, requesterId) {
   const likeCount = db.prepare("SELECT COUNT(*) c FROM post_likes WHERE post_id = ?").get(post.id).c;
   const commentCount = db.prepare("SELECT COUNT(*) c FROM post_comments WHERE post_id = ?").get(post.id).c;
@@ -1439,43 +1513,110 @@ function decoratePost(post, requesterId) {
 
   let mediaUrl = post.media_url;
   let locked = false;
+  let unlockedByMe = false;
   if (post.is_private) {
     const isOwner = post.user_id === requesterId;
-    if (!isOwner) {
+    if (isOwner) {
+      unlockedByMe = true;
+    } else {
       const requester = db.prepare("SELECT plan FROM users WHERE id = ?").get(requesterId);
-      if (!isVip(requester?.plan)) {
-        mediaUrl = null; // on ne fuite jamais l'URL réelle à qui n'a pas le droit de la voir
+      // VIP : accès automatique inclus dans l'abonnement, sans payer de Coins. Les autres doivent
+      // avoir acheté le déverrouillage de CE contenu précis (post_unlocks) pour le voir.
+      const hasVipAccess = isVip(requester?.plan);
+      const hasPurchased = !!db.prepare("SELECT 1 FROM post_unlocks WHERE user_id = ? AND post_id = ?").get(requesterId, post.id);
+      unlockedByMe = hasVipAccess || hasPurchased;
+      if (!unlockedByMe) {
+        mediaUrl = null; // on ne fuite jamais l'URL réelle à qui n'a pas payé/n'est pas VIP
         locked = true;
       }
     }
   }
-  return { ...post, media_url: mediaUrl, locked, likeCount, commentCount, viewCount, likedByMe };
+  return {
+    ...post,
+    media_url: mediaUrl,
+    locked,
+    unlockedByMe,
+    unlockPriceCoins: post.is_private ? post.unlock_price_coins || UNLOCK_PRICE_DEFAULT : null,
+    likeCount, commentCount, viewCount, likedByMe,
+  };
 }
 
 // Créer une publication (photo ou vidéo) sur son propre profil
 app.post("/api/posts", authMiddleware, (req, res) => {
-  const { mediaUrl, mediaType, caption, isPrivate, monetized } = req.body || {};
+  const { mediaUrl, mediaType, caption, locked, isPrivate, unlockPriceCoins, monetized } = req.body || {};
   if (!mediaUrl) return res.status(400).json({ error: "Média manquant." });
   const type = mediaType === "video" ? "video" : "photo";
 
+  // "locked" : contenu verrouillé, déverrouillable par n'importe qui contre un prix en Lovinia
+  // Coins fixé par le créateur (comme une story payante), avec accès automatique pour les VIP.
+  // "isPrivate" reste accepté pour compatibilité avec d'anciens appels, traité comme "locked".
+  const wantsLocked = !!(locked || isPrivate);
   let privateFlag = 0;
-  if (isPrivate) {
-    const owner = db.prepare("SELECT plan, verification_status FROM users WHERE id = ?").get(req.userId);
-    if (!isGoldOrAbove(owner?.plan)) {
-      return res.status(403).json({ error: "Le Pack Gold est nécessaire pour publier du contenu privé.", code: "GOLD_REQUIRED" });
-    }
+  let unlockPrice = 0;
+  if (wantsLocked) {
+    const owner = db.prepare("SELECT verification_status FROM users WHERE id = ?").get(req.userId);
     if (owner?.verification_status !== "verified") {
-      return res.status(403).json({ error: "Seuls les profils vérifiés (badge bleu) peuvent publier du contenu privé.", code: "VERIFICATION_REQUIRED" });
+      return res.status(403).json({ error: "Seuls les profils vérifiés (badge bleu) peuvent publier du contenu verrouillé.", code: "VERIFICATION_REQUIRED" });
     }
     privateFlag = 1;
+    const requested = Number(unlockPriceCoins);
+    unlockPrice = Number.isFinite(requested) && requested > 0
+      ? Math.min(UNLOCK_PRICE_MAX, Math.max(UNLOCK_PRICE_MIN, Math.round(requested)))
+      : UNLOCK_PRICE_DEFAULT;
   }
   // "Contenu monétisé" : gratuit et ouvert à tous, aucun pack ni badge vérifié requis pour publier.
   const monetizedFlag = monetized ? 1 : 0;
 
   const result = db
-    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption, is_private, monetized) VALUES (?, ?, ?, ?, ?, ?)")
-    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500), privateFlag, monetizedFlag);
+    .prepare("INSERT INTO posts (user_id, media_url, media_type, caption, is_private, monetized, unlock_price_coins) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(req.userId, mediaUrl, type, (caption || "").slice(0, 500), privateFlag, monetizedFlag, unlockPrice);
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(result.lastInsertRowid);
+  res.json({ post: decoratePost(post, req.userId) });
+});
+
+// Déverrouiller un contenu verrouillé contre des Lovinia Coins (comme une story payante). Les VIP
+// n'ont pas besoin de cette route : ils voient déjà tout le contenu verrouillé automatiquement.
+app.post("/api/posts/:postId/unlock", authMiddleware, (req, res) => {
+  const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
+  if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (!post.is_private) return res.status(400).json({ error: "Ce contenu n'est pas verrouillé." });
+  if (post.user_id === req.userId) return res.json({ post: decoratePost(post, req.userId) });
+  if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
+
+  const requester = db.prepare("SELECT plan, coins FROM users WHERE id = ?").get(req.userId);
+  if (isVip(requester?.plan)) {
+    return res.json({ post: decoratePost(post, req.userId) }); // déjà inclus dans l'abonnement VIP
+  }
+  const already = db.prepare("SELECT 1 FROM post_unlocks WHERE user_id = ? AND post_id = ?").get(req.userId, post.id);
+  if (already) {
+    return res.json({ post: decoratePost(post, req.userId) });
+  }
+
+  const price = post.unlock_price_coins || UNLOCK_PRICE_DEFAULT;
+  if ((requester?.coins || 0) < price) {
+    return res.status(402).json({ error: "Pas assez de Lovinia Coins pour débloquer ce contenu.", code: "INSUFFICIENT_COINS", cost: price });
+  }
+
+  const recipient = db.prepare("SELECT id, name FROM users WHERE id = ?").get(post.user_id);
+  const recipientGain = Math.floor(price * GIFT_RECIPIENT_SHARE);
+  const platformShare = price - recipientGain;
+
+  const unlock = db.transaction(() => {
+    db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(price, req.userId);
+    db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -price, "Déverrouillage de contenu");
+    db.prepare("UPDATE users SET creator_balance = creator_balance + ? WHERE id = ?").run(recipientGain, post.user_id);
+    db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(post.user_id, recipientGain, "Déverrouillage de contenu (part créateur)");
+    db.prepare("INSERT INTO platform_revenue (amount, source, reference_id) VALUES (?, ?, ?)").run(platformShare, "Commission déverrouillage de contenu", post.id);
+    db.prepare("INSERT INTO post_unlocks (user_id, post_id) VALUES (?, ?)").run(req.userId, post.id);
+  });
+  unlock();
+
+  sendPushToUser(post.user_id, {
+    title: "Lovinia 💰",
+    body: `Quelqu'un a débloqué l'un de tes contenus verrouillés !`,
+    url: "/",
+  }).catch(() => {});
+
   res.json({ post: decoratePost(post, req.userId) });
 });
 
@@ -1492,13 +1633,25 @@ app.get("/api/posts/mine", authMiddleware, (req, res) => {
     )
     .all(req.userId);
   const coinsMap = new Map(coinsByPost.map((r) => [r.postId, Math.floor(r.totalPrice * GIFT_RECIPIENT_SHARE)]));
+  // Revenu des déverrouillages, ajouté au même titre que les cadeaux pour chaque publication verrouillée.
+  const unlocksByPost = db
+    .prepare(
+      `SELECT pu.post_id as postId, COUNT(*) as n, p.unlock_price_coins as price
+       FROM post_unlocks pu JOIN posts p ON p.id = pu.post_id
+       WHERE p.user_id = ? GROUP BY pu.post_id`
+    )
+    .all(req.userId);
+  unlocksByPost.forEach((r) => {
+    const add = Math.floor(r.n * (r.price || 0) * GIFT_RECIPIENT_SHARE);
+    coinsMap.set(r.postId, (coinsMap.get(r.postId) || 0) + add);
+  });
   res.json({ posts: rows.map((p) => ({ ...decoratePost(p, req.userId), coinsEarned: coinsMap.get(p.id) || 0 })) });
 });
 
 // Résumé "Contenu monétisé" : total des Coins gagnés grâce aux publications, tous posts confondus.
 app.get("/api/me/monetized-summary", authMiddleware, (req, res) => {
   const postCount = db.prepare("SELECT COUNT(*) c FROM posts WHERE user_id = ?").get(req.userId).c;
-  const totalPrice = db
+  const totalGiftPrice = db
     .prepare(
       `SELECT COALESCE(SUM(g.price_coins), 0) as totalPrice
        FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id
@@ -1508,7 +1661,17 @@ app.get("/api/me/monetized-summary", authMiddleware, (req, res) => {
   const giftCount = db
     .prepare("SELECT COUNT(*) c FROM gifts_sent WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)")
     .get(req.userId).c;
-  res.json({ postCount, giftCount, coinsEarned: Math.floor(totalPrice * GIFT_RECIPIENT_SHARE) });
+  // Revenu des déverrouillages de contenu verrouillé (story payante), à additionner aux cadeaux —
+  // les deux créditent creator_balance de la même façon (part créateur à GIFT_RECIPIENT_SHARE).
+  const unlockRow = db
+    .prepare(
+      `SELECT COUNT(*) as unlockCount, COALESCE(SUM(p.unlock_price_coins), 0) as totalUnlockPrice
+       FROM post_unlocks pu JOIN posts p ON p.id = pu.post_id
+       WHERE p.user_id = ?`
+    )
+    .get(req.userId);
+  const coinsEarned = Math.floor(totalGiftPrice * GIFT_RECIPIENT_SHARE) + Math.floor(unlockRow.totalUnlockPrice * GIFT_RECIPIENT_SHARE);
+  res.json({ postCount, giftCount, unlockCount: unlockRow.unlockCount, coinsEarned });
 });
 
 // Publications d'un autre utilisateur (affichées sur son profil)
@@ -1684,10 +1847,9 @@ app.post("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   if (post.user_id === req.userId) return res.status(400).json({ error: "Tu ne peux pas t'envoyer un cadeau à toi-même." });
   if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
 
+  // Depuis la refonte du contenu verrouillé, envoyer un cadeau n'exige plus le Pack VIP : le
+  // verrou (voir/débloquer le média) est géré séparément par /api/posts/:postId/unlock.
   const senderInfo = db.prepare("SELECT name, plan FROM users WHERE id = ?").get(req.userId);
-  if (post.is_private && !isVip(senderInfo?.plan)) {
-    return res.status(403).json({ error: "Le Pack VIP est nécessaire pour interagir avec du contenu privé.", code: "VIP_REQUIRED" });
-  }
 
   const recipient = db.prepare("SELECT id, name, coins, verification_status, accept_gifts, gift_senders_restriction FROM users WHERE id = ?").get(post.user_id);
   if (!recipient) return res.status(404).json({ error: "Destinataire introuvable." });
@@ -1834,9 +1996,9 @@ app.get("/api/notifications/summary", authMiddleware, (req, res) => {
 
 // Bouton "Message" directement sur la fiche de découverte : si les deux personnes sont déjà
 // matchées, on rouvre simplement cette conversation (accessible à tout le monde, gratuit ou pas).
-// Sinon, seul un utilisateur avec un plan payant (Premium/VIP/Gold — donc "plan !== 'free'") peut
-// créer la conversation sans match préalable ; un utilisateur gratuit reçoit une erreur explicite
-// avec le code MATCH_REQUIRED que le frontend affiche comme message d'incitation à l'abonnement.
+// Sinon, seul un utilisateur Premium ou VIP (Gold seul n'y donne PAS droit) peut créer la
+// conversation sans match préalable ; les autres reçoivent une erreur explicite avec le code
+// MATCH_REQUIRED que le frontend affiche comme message d'incitation à l'abonnement.
 app.post("/api/messages/start/:userId", authMiddleware, (req, res) => {
   const targetId = Number(req.params.userId);
   if (!targetId || targetId === req.userId) {
@@ -1857,10 +2019,9 @@ app.post("/api/messages/start/:userId", authMiddleware, (req, res) => {
 
   if (!match) {
     const user = db.prepare("SELECT plan FROM users WHERE id = ?").get(req.userId);
-    const isPremium = user?.plan && user.plan !== "free";
-    if (!isPremium) {
+    if (!isPremiumOrAbove(user?.plan)) {
       return res.status(403).json({
-        error: "Vous devez être matché avec cette personne pour lui écrire. Passez en Premium pour pouvoir envoyer des messages sans match préalable.",
+        error: "Vous devez être matché avec cette personne pour lui écrire. Passez au plan Premium ou VIP pour pouvoir envoyer des messages sans match préalable.",
         code: "MATCH_REQUIRED",
       });
     }
@@ -2436,7 +2597,7 @@ app.post("/api/admin/matchmaking/suggest", adminMiddleware, (req, res) => {
 // Tant que CINETPAY_API_KEY / CINETPAY_SITE_ID ne sont pas définis sur Railway, enabled = false
 // et le frontend continue d'utiliser /api/subscribe (activation immédiate, mode démonstration).
 app.get("/api/payments/config", (req, res) => {
-  res.json({ enabled: CINETPAY_ENABLED, currency: CINETPAY_CURRENCY, coinPacks: COIN_PACKS });
+  res.json({ enabled: CINETPAY_ENABLED, currency: CINETPAY_CURRENCY, coinPacks: COIN_PACKS, coinPackDiscountByPlan: COIN_PACK_DISCOUNT });
 });
 
 // Initier le paiement réel d'un abonnement (redirige ensuite vers payment_url).
@@ -2464,20 +2625,28 @@ app.post("/api/payments/subscribe/init", authMiddleware, async (req, res) => {
   }
 });
 
+// Réduction sur l'achat de Coins pour les abonnés payants ("Réduction sur les LoviCoins",
+// promise depuis longtemps dans la liste des avantages Premium/VIP mais jamais implémentée
+// jusqu'ici). Gold : -10%, Premium : -20%, VIP : -30%.
+const COIN_PACK_DISCOUNT = { free: 0, gold: 0.10, premium: 0.20, vip: 0.30 };
+
 // Initier le paiement réel d'un pack de Coins.
 app.post("/api/payments/coins/init", authMiddleware, async (req, res) => {
   if (!CINETPAY_ENABLED) return res.status(503).json({ error: "Le paiement réel n'est pas encore configuré côté serveur." });
   const packKey = req.body?.pack;
   const pack = COIN_PACKS[packKey];
   if (!pack) return res.status(400).json({ error: "Pack de Coins inconnu." });
+  const buyer = db.prepare("SELECT plan FROM users WHERE id = ?").get(req.userId);
+  const discount = COIN_PACK_DISCOUNT[buyer?.plan] || 0;
+  const finalPriceXAF = Math.round(pack.priceXAF * (1 - discount));
   const transactionId = `coins${req.userId}t${Date.now()}${crypto.randomBytes(4).toString("hex")}`;
   try {
     db.prepare(
       `INSERT INTO payment_transactions (transaction_id, user_id, kind, pack_key, coins_amount, amount, currency, status)
        VALUES (?, ?, 'coins', ?, ?, ?, ?, 'pending')`
-    ).run(transactionId, req.userId, packKey, pack.coins, pack.priceXAF, CINETPAY_CURRENCY);
+    ).run(transactionId, req.userId, packKey, pack.coins, finalPriceXAF, CINETPAY_CURRENCY);
     const { paymentUrl } = await cinetpayInitPayment({
-      transactionId, amount: pack.priceXAF, description: `Lovinia — ${pack.coins} Coins`, customerId: req.userId,
+      transactionId, amount: finalPriceXAF, description: `Lovinia — ${pack.coins} Coins${discount ? ` (-${Math.round(discount * 100)}%)` : ""}`, customerId: req.userId,
     });
     res.json({ paymentUrl, transactionId });
   } catch (e) {
@@ -2571,7 +2740,8 @@ app.get("/api/me/creator-dashboard", authMiddleware, (req, res) => {
       )
       .get(p.id);
     const viewCount = db.prepare("SELECT COUNT(*) c FROM post_views WHERE post_id = ?").get(p.id).c;
-    return { id: p.id, media_url: p.media_url, media_type: p.media_type, created_at: p.created_at, giftCount: gifts.count, viewCount };
+    const unlockCount = p.is_private ? db.prepare("SELECT COUNT(*) c FROM post_unlocks WHERE post_id = ?").get(p.id).c : 0;
+    return { id: p.id, media_url: p.media_url, media_type: p.media_type, created_at: p.created_at, giftCount: gifts.count, unlockCount, viewCount };
   });
   const totalGiftsReceived = db
     .prepare(
@@ -2629,28 +2799,71 @@ app.post("/api/admin/withdrawals/:id/process", adminMiddleware, (req, res) => {
 });
 
 app.post("/api/boost", authMiddleware, (req, res) => {
-  const user = db.prepare("SELECT coins FROM users WHERE id = ?").get(req.userId);
+  const user = db.prepare("SELECT coins, plan FROM users WHERE id = ?").get(req.userId);
   if ((user?.coins || 0) < BOOST_COST) {
     return res.status(402).json({ error: "Pas assez de Lovinia Coins pour un boost.", code: "INSUFFICIENT_COINS", cost: BOOST_COST });
   }
-  const until = new Date(Date.now() + BOOST_DURATION_MIN * 60000).toISOString().slice(0, 19).replace("T", " ");
+  // Avantage réel Premium/VIP ("Mise en avant du profil") : durée de boost doublée pour le même
+  // prix en coins, plutôt qu'une simple promesse marketing sans effet technique.
+  const durationMin = isPremiumOrAbove(user?.plan) ? BOOST_DURATION_MIN * 2 : BOOST_DURATION_MIN;
+  const until = new Date(Date.now() + durationMin * 60000).toISOString().slice(0, 19).replace("T", " ");
   db.prepare("UPDATE users SET coins = coins - ?, boosted_until = ? WHERE id = ?").run(BOOST_COST, until, req.userId);
   db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -BOOST_COST, "Boost de profil");
-  res.json({ boostedUntil: until });
+  res.json({ boostedUntil: until, durationMin });
 });
 
 app.get("/api/me/limits", authMiddleware, (req, res) => {
   const user = db.prepare("SELECT genre, plan FROM users WHERE id = ?").get(req.userId);
-  const isPremium = user?.plan && user.plan !== "free";
+  const hasUnlimitedLikes = isGoldOrAbove(user?.plan);
   const limit = dailyLikeLimit(user?.genre);
   const used = countTodayLikes(req.userId);
   res.json({
     plan: user?.plan || "free",
-    unlimited: !!isPremium,
+    unlimited: !!hasUnlimitedLikes,
     limit,
     used,
-    remaining: isPremium ? null : Math.max(0, limit - used),
+    remaining: hasUnlimitedLikes ? null : Math.max(0, limit - used),
   });
+});
+
+// "Voir qui a aimé ton profil" — avantage Premium/VIP promis depuis longtemps dans la liste des
+// fonctionnalités mais jamais construit jusqu'ici. Renvoie les profils qui t'ont liké/super-liké
+// et avec qui tu n'es pas encore matché. Les comptes Gold/gratuits reçoivent un simple compteur
+// (pour donner envie de passer Premium) sans la liste détaillée.
+app.get("/api/me/likes-received", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT plan FROM users WHERE id = ?").get(req.userId);
+  const rows = db
+    .prepare(
+      `SELECT s.from_user_id as id, s.action, s.created_at, u.name, u.age, u.img, u.city
+       FROM swipes s
+       JOIN users u ON u.id = s.from_user_id
+       WHERE s.to_user_id = ? AND s.action IN ('like','superlike')
+         AND NOT EXISTS (
+           SELECT 1 FROM matches m
+           WHERE m.user_a_id = MIN(s.from_user_id, s.to_user_id) AND m.user_b_id = MAX(s.from_user_id, s.to_user_id)
+         )
+       ORDER BY s.created_at DESC`
+    )
+    .all(req.userId);
+
+  if (!isPremiumOrAbove(user?.plan)) {
+    return res.json({ count: rows.length, locked: true, profiles: [] });
+  }
+  res.json({ count: rows.length, locked: false, profiles: rows });
+});
+
+// Statistiques détaillées — avantage Premium/VIP promis mais jamais construit jusqu'ici.
+app.get("/api/me/stats", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT plan FROM users WHERE id = ?").get(req.userId);
+  if (!isPremiumOrAbove(user?.plan)) {
+    return res.status(403).json({ error: "Les statistiques détaillées sont réservées aux membres Premium et VIP.", code: "PREMIUM_REQUIRED" });
+  }
+  const likesSent = db.prepare("SELECT COUNT(*) as n FROM swipes WHERE from_user_id = ? AND action IN ('like','superlike')").get(req.userId).n;
+  const superlikesSent = db.prepare("SELECT COUNT(*) as n FROM swipes WHERE from_user_id = ? AND action = 'superlike'").get(req.userId).n;
+  const likesReceived = db.prepare("SELECT COUNT(*) as n FROM swipes WHERE to_user_id = ? AND action IN ('like','superlike')").get(req.userId).n;
+  const matches = db.prepare("SELECT COUNT(*) as n FROM matches WHERE user_a_id = ? OR user_b_id = ?").get(req.userId, req.userId).n;
+  const passesSent = db.prepare("SELECT COUNT(*) as n FROM swipes WHERE from_user_id = ? AND action = 'pass'").get(req.userId).n;
+  res.json({ likesSent, superlikesSent, likesReceived, matches, passesSent });
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
