@@ -692,11 +692,24 @@ function isGoldOrAbove(plan) { return planTier(plan) >= 1; }
 function isPremiumOrAbove(plan) { return planTier(plan) >= 2; }
 function isVip(plan) { return planTier(plan) >= 3; }
 
+// Journal immuable des likes/superlikes, distinct de "swipes" : "swipes" reflète l'état ACTUEL
+// (une seule ligne par paire, remplacée à chaque nouveau swipe et supprimée par /api/swipe/undo),
+// alors que like_events n'est jamais supprimé — sans ça, un compte gratuit pouvait contourner sa
+// limite quotidienne en enchaînant like → undo → like → undo (le "used" recalculé sur "swipes"
+// retombait à chaque annulation). Bug corrigé le 08/2026.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS like_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
 function countTodayLikes(userId) {
   const row = db
     .prepare(
-      `SELECT COUNT(*) as n FROM swipes
-       WHERE from_user_id = ? AND action IN ('like','superlike') AND date(created_at) = date('now')`
+      `SELECT COUNT(*) as n FROM like_events
+       WHERE user_id = ? AND date(created_at) = date('now')`
     )
     .get(userId);
   return row.n;
@@ -996,7 +1009,7 @@ app.post("/api/auth/logout", authMiddleware, (req, res) => {
 });
 
 app.post("/api/auth/google", async (req, res) => {
-  const { credential } = req.body || {};
+  const { credential, acceptedTerms } = req.body || {};
   if (!credential) return res.status(400).json({ error: "Jeton Google manquant." });
   if (!GOOGLE_CLIENT_ID) return res.status(500).json({ error: "Connexion Google non configurée côté serveur." });
 
@@ -1020,10 +1033,15 @@ app.post("/api/auth/google", async (req, res) => {
   let user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
 
   if (!user) {
+    // Comme pour l'inscription classique, la création d'un compte exige d'avoir accepté les CGU/
+    // Politique de confidentialité — manquant jusqu'ici sur ce parcours (bug corrigé le 08/2026).
+    if (!acceptedTerms) {
+      return res.status(400).json({ error: "Tu dois accepter les Conditions d'utilisation et la Politique de confidentialité pour créer un compte." });
+    }
     const randomPassword = crypto.randomBytes(24).toString("hex");
     const hash = await bcrypt.hash(randomPassword, 10);
     const info = db
-      .prepare("INSERT INTO users (name, email, password_hash, img, email_verified) VALUES (?, ?, ?, ?, 1)")
+      .prepare("INSERT INTO users (name, email, password_hash, img, email_verified, terms_accepted_at) VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)")
       .run(payload.name || email.split("@")[0], email, hash, payload.picture || "");
     user = db.prepare("SELECT * FROM users WHERE id = ?").get(info.lastInsertRowid);
   }
@@ -1291,6 +1309,10 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     return res.status(400).json({ error: "Paramètres invalides." });
   }
 
+  if (isBlockedEitherWay(req.userId, toUserId)) {
+    return res.status(403).json({ error: "Action impossible." });
+  }
+
   const user = db.prepare("SELECT genre, plan, coins, email_verified, primary_photo_status FROM users WHERE id = ?").get(req.userId);
   // Likes illimités : à partir de Gold (palier d'entrée). Super Like : réservé à Premium et au-dessus
   // (Gold seul n'y donne pas droit) — voir la hiérarchie PLAN_TIER plus haut dans ce fichier.
@@ -1331,6 +1353,17 @@ app.post("/api/swipe", authMiddleware, (req, res) => {
     }
     db.prepare("UPDATE users SET coins = coins - ? WHERE id = ?").run(SUPERLIKE_COST, req.userId);
     db.prepare("INSERT INTO coin_transactions (user_id, amount, reason) VALUES (?, ?, ?)").run(req.userId, -SUPERLIKE_COST, "Super Like envoyé");
+  }
+
+  // On journalise le like/superlike AVANT l'upsert, seulement s'il n'était pas déjà comptabilisé
+  // (évite de compter deux fois un double-clic qui renvoie la même action, tout en comptant bien
+  // un pass -> like). Ce journal (like_events) n'est jamais effacé par /api/swipe/undo, contrairement
+  // à la ligne "swipes" elle-même — voir countTodayLikes plus haut.
+  if (action === "like" || action === "superlike") {
+    const existing = db.prepare("SELECT action FROM swipes WHERE from_user_id = ? AND to_user_id = ?").get(req.userId, toUserId);
+    if (!existing || (existing.action !== "like" && existing.action !== "superlike")) {
+      db.prepare("INSERT INTO like_events (user_id) VALUES (?)").run(req.userId);
+    }
   }
 
   // On rafraîchit aussi created_at à chaque nouveau swipe (y compris en cas de re-pass après
@@ -1550,7 +1583,11 @@ app.post("/api/posts", authMiddleware, (req, res) => {
   // "locked" : contenu verrouillé, déverrouillable par n'importe qui contre un prix en Lovinia
   // Coins fixé par le créateur (comme une story payante), avec accès automatique pour les VIP.
   // "isPrivate" reste accepté pour compatibilité avec d'anciens appels, traité comme "locked".
+  // Les deux catégories sont mutuellement exclusives : un contenu verrouillé (payant à l'unité)
+  // ne peut pas aussi être "monetized" (public et gratuit) — locked est prioritaire si les deux
+  // sont envoyés par erreur, pour ne jamais publier un contenu gratuit et payant à la fois.
   const wantsLocked = !!(locked || isPrivate);
+  const wantsMonetized = !!monetized && !wantsLocked;
   let privateFlag = 0;
   let unlockPrice = 0;
   if (wantsLocked) {
@@ -1565,7 +1602,7 @@ app.post("/api/posts", authMiddleware, (req, res) => {
       : UNLOCK_PRICE_DEFAULT;
   }
   // "Contenu monétisé" : gratuit et ouvert à tous, aucun pack ni badge vérifié requis pour publier.
-  const monetizedFlag = monetized ? 1 : 0;
+  const monetizedFlag = wantsMonetized ? 1 : 0;
 
   const result = db
     .prepare("INSERT INTO posts (user_id, media_url, media_type, caption, is_private, monetized, unlock_price_coins) VALUES (?, ?, ?, ?, ?, ?, ?)")
@@ -1651,27 +1688,24 @@ app.get("/api/posts/mine", authMiddleware, (req, res) => {
 // Résumé "Contenu monétisé" : total des Coins gagnés grâce aux publications, tous posts confondus.
 app.get("/api/me/monetized-summary", authMiddleware, (req, res) => {
   const postCount = db.prepare("SELECT COUNT(*) c FROM posts WHERE user_id = ?").get(req.userId).c;
-  const totalGiftPrice = db
-    .prepare(
-      `SELECT COALESCE(SUM(g.price_coins), 0) as totalPrice
-       FROM gifts_sent gs JOIN gift_catalog g ON g.id = gs.gift_id
-       WHERE gs.post_id IN (SELECT id FROM posts WHERE user_id = ?)`
-    )
-    .get(req.userId).totalPrice;
   const giftCount = db
     .prepare("SELECT COUNT(*) c FROM gifts_sent WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)")
     .get(req.userId).c;
-  // Revenu des déverrouillages de contenu verrouillé (story payante), à additionner aux cadeaux —
-  // les deux créditent creator_balance de la même façon (part créateur à GIFT_RECIPIENT_SHARE).
-  const unlockRow = db
+  const unlockCount = db
+    .prepare("SELECT COUNT(*) c FROM post_unlocks pu JOIN posts p ON p.id = pu.post_id WHERE p.user_id = ?")
+    .get(req.userId).c;
+  // "coinsEarned" (total à VIE, ne baisse pas après un retrait) vient de la somme des lignes
+  // coin_transactions réellement créditées (chaque cadeau/déverrouillage y arrondit déjà sa propre
+  // part à 70% au moment du crédit) — recalculer un total à partir de SUM(prix) puis arrondir une
+  // seule fois pouvait légèrement dériver de la somme réelle des arrondis individuels, et utiliser
+  // creator_balance directement aurait fait baisser ce "total" après chaque retrait. Bug corrigé le 08/2026.
+  const coinsEarned = db
     .prepare(
-      `SELECT COUNT(*) as unlockCount, COALESCE(SUM(p.unlock_price_coins), 0) as totalUnlockPrice
-       FROM post_unlocks pu JOIN posts p ON p.id = pu.post_id
-       WHERE p.user_id = ?`
+      `SELECT COALESCE(SUM(amount), 0) as total FROM coin_transactions
+       WHERE user_id = ? AND (reason LIKE '%(contenu monétisé)' OR reason = 'Déverrouillage de contenu (part créateur)')`
     )
-    .get(req.userId);
-  const coinsEarned = Math.floor(totalGiftPrice * GIFT_RECIPIENT_SHARE) + Math.floor(unlockRow.totalUnlockPrice * GIFT_RECIPIENT_SHARE);
-  res.json({ postCount, giftCount, unlockCount: unlockRow.unlockCount, coinsEarned });
+    .get(req.userId).total;
+  res.json({ postCount, giftCount, unlockCount, coinsEarned });
 });
 
 // Publications d'un autre utilisateur (affichées sur son profil)
@@ -1755,6 +1789,7 @@ app.get("/api/posts/:postId/views", authMiddleware, (req, res) => {
 app.get("/api/posts/:postId/comments", authMiddleware, (req, res) => {
   const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(req.params.postId);
   if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
   const rows = db
     .prepare(
       `SELECT c.id, c.text, c.created_at, c.user_id, u.name, u.img
@@ -1812,6 +1847,7 @@ app.get("/api/gifts/catalog", authMiddleware, (req, res) => {
 app.get("/api/posts/:postId/gifts", authMiddleware, (req, res) => {
   const post = db.prepare("SELECT user_id FROM posts WHERE id = ?").get(req.params.postId);
   if (!post) return res.status(404).json({ error: "Publication introuvable." });
+  if (isBlockedEitherWay(req.userId, post.user_id)) return res.status(403).json({ error: "Accès refusé." });
   const owner = db.prepare("SELECT hide_gift_count FROM users WHERE id = ?").get(post.user_id);
   if (owner?.hide_gift_count && post.user_id !== req.userId) {
     return res.json({ gifts: [], total: 0, hidden: true });
@@ -2040,6 +2076,15 @@ app.post("/api/messages/start/:userId", authMiddleware, (req, res) => {
 
 // ---------- Messages ----------
 app.get("/api/matches/:matchId/messages", authMiddleware, (req, res) => {
+  // Faille corrigée (08/2026) : cette route ne vérifiait pas que req.userId fait bien partie du
+  // match demandé — n'importe quel compte pouvait lire (et marquer comme lus) les messages de
+  // n'importe quelle conversation en devinant un matchId. Toutes les autres routes liées à un
+  // match (POST messages, /profile) faisaient déjà cette vérification ; on l'aligne ici.
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.matchId);
+  if (!match) return res.status(404).json({ error: "Match introuvable." });
+  if (match.user_a_id !== req.userId && match.user_b_id !== req.userId) {
+    return res.status(403).json({ error: "Accès refusé." });
+  }
   const messages = db
     .prepare("SELECT * FROM messages WHERE match_id = ? ORDER BY created_at ASC")
     .all(req.params.matchId);
